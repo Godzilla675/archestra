@@ -13,7 +13,13 @@ import {
   type TableRowAction,
   TableRowActions,
 } from "@/components/table-row-actions";
+import { Badge } from "@/components/ui/badge";
 import { DataTable } from "@/components/ui/data-table";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useDataTableQueryParams } from "@/lib/hooks/use-data-table-query-params";
 import {
   type KnowledgeBaseDocumentListItem,
@@ -120,6 +126,54 @@ export function ConnectorDocumentsTable({
           ) : (
             <span className="text-sm text-muted-foreground">-</span>
           ),
+      },
+      {
+        id: "permissionSyncStatus",
+        header: "Permission Sync",
+        cell: ({ row }) => {
+          const status = row.original.permissionSyncStatus;
+          const metadata = row.original.permissionSyncMetadata as {
+            skippedGroups?: string[];
+            error?: string;
+          } | null;
+
+          if (!status)
+            return <span className="text-sm text-muted-foreground">-</span>;
+
+          if (status === "synced") {
+            return (
+              <Badge
+                variant="secondary"
+                className="bg-emerald-500/10 text-emerald-500 border-emerald-500/20 gap-1 capitalize"
+              >
+                Synced
+              </Badge>
+            );
+          }
+
+          const skippedGroups = metadata?.skippedGroups || [];
+          const tooltipContent =
+            skippedGroups.length > 0
+              ? `Unmapped groups: ${skippedGroups.join(", ")}`
+              : metadata?.error ||
+                "Group mappings are incomplete (fail-closed)";
+
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span>
+                  <Badge
+                    variant="destructive"
+                    className="bg-amber-500/10 text-amber-500 border-amber-500/20 gap-1 capitalize cursor-help"
+                  >
+                    Skipped
+                  </Badge>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>{tooltipContent}</TooltipContent>
+            </Tooltip>
+          );
+        },
       },
       {
         id: "updatedAt",

@@ -54,6 +54,8 @@ class KbDocumentModel {
         metadata: schema.kbDocumentsTable.metadata,
         embeddingStatus: schema.kbDocumentsTable.embeddingStatus,
         chunkCount: schema.kbDocumentsTable.chunkCount,
+        permissionSyncStatus: schema.kbDocumentsTable.permissionSyncStatus,
+        permissionSyncMetadata: schema.kbDocumentsTable.permissionSyncMetadata,
         createdAt: schema.kbDocumentsTable.createdAt,
         updatedAt: schema.kbDocumentsTable.updatedAt,
       })
@@ -111,6 +113,8 @@ class KbDocumentModel {
         metadata: schema.kbDocumentsTable.metadata,
         embeddingStatus: schema.kbDocumentsTable.embeddingStatus,
         chunkCount: schema.kbDocumentsTable.chunkCount,
+        permissionSyncStatus: schema.kbDocumentsTable.permissionSyncStatus,
+        permissionSyncMetadata: schema.kbDocumentsTable.permissionSyncMetadata,
         createdAt: schema.kbDocumentsTable.createdAt,
         updatedAt: schema.kbDocumentsTable.updatedAt,
       })
@@ -203,25 +207,35 @@ class KbDocumentModel {
   }
 
   static async create(data: InsertKbDocument): Promise<KbDocument> {
+    const insertData = {
+      ...data,
+      permissionSyncStatus: data.permissionSyncStatus as "synced" | "skipped_unresolvable" | undefined,
+    } as typeof schema.kbDocumentsTable.$inferInsert;
+
     const [result] = await db
       .insert(schema.kbDocumentsTable)
-      .values(data)
+      .values(insertData)
       .returning();
-
-    return result;
+ 
+    return result as KbDocument;
   }
 
   static async update(
     id: string,
     data: Partial<UpdateKbDocument>,
   ): Promise<KbDocument | null> {
+    const updateData = {
+      ...data,
+      permissionSyncStatus: data.permissionSyncStatus as "synced" | "skipped_unresolvable" | undefined,
+    } as typeof schema.kbDocumentsTable.$inferInsert;
+
     const [result] = await db
       .update(schema.kbDocumentsTable)
-      .set(data)
+      .set(updateData)
       .where(eq(schema.kbDocumentsTable.id, id))
       .returning();
-
-    return result ?? null;
+ 
+    return result as KbDocument | null;
   }
 
   static async delete(id: string): Promise<boolean> {
@@ -239,6 +253,13 @@ class KbDocumentModel {
       .where(eq(schema.kbDocumentsTable.connectorId, connectorId));
 
     return result?.count ?? 0;
+  }
+
+  static async findAllByConnector(connectorId: string): Promise<KbDocument[]> {
+    return await db
+      .select()
+      .from(schema.kbDocumentsTable)
+      .where(eq(schema.kbDocumentsTable.connectorId, connectorId));
   }
 
   static async countByConnectorWithSearch(params: {
@@ -294,6 +315,8 @@ class KbDocumentModel {
         metadata: schema.kbDocumentsTable.metadata,
         embeddingStatus: schema.kbDocumentsTable.embeddingStatus,
         chunkCount: schema.kbDocumentsTable.chunkCount,
+        permissionSyncStatus: schema.kbDocumentsTable.permissionSyncStatus,
+        permissionSyncMetadata: schema.kbDocumentsTable.permissionSyncMetadata,
         createdAt: schema.kbDocumentsTable.createdAt,
         updatedAt: schema.kbDocumentsTable.updatedAt,
       })

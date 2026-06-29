@@ -119,6 +119,146 @@ export class ConfluenceConnector extends BaseConnector {
     }
   }
 
+  async resolveDocumentPermissions(
+    document: ConnectorDocument,
+    params: {
+      config: Record<string, unknown>;
+      credentials: ConnectorCredentials;
+    },
+  ): Promise<ConnectorDocument["permissions"]> {
+    const config = parseConfluenceConfig(params.config);
+    if (!config) {
+      return { isPublic: false };
+    }
+
+    const client = createConfluenceClient(config, params.credentials, this.log);
+
+    // 1. Get ancestors from document metadata
+    const ancestors =
+      (document.metadata?.ancestors as Array<{ id: string }>) || [];
+    // Check closest first: page itself, then closest ancestor (reverse order of ancestors)
+    const pageIdsToCheck = [
+      document.id,
+      ...ancestors.map((a) => a.id).reverse(),
+    ];
+
+    for (const pageId of pageIdsToCheck) {
+      try {
+        // biome-ignore lint/suspicious/noExplicitAny: API client response has dynamic/untyped payload
+        const restrictionRes: any = await client.sendRequest(
+          {
+            url: `/api/content/${pageId}/restriction/byOperation`,
+            method: "GET",
+          },
+          // biome-ignore lint/suspicious/noExplicitAny: API client accepts any type
+          undefined as any,
+        );
+
+        const readRestrictions = restrictionRes?.read;
+        if (readRestrictions?.restrictions) {
+          const userResults = readRestrictions.restrictions.user?.results || [];
+          const groupResults =
+            readRestrictions.restrictions.group?.results || [];
+
+          // If there are specific users or groups restricted on this page or any parent,
+          // then this page is NOT public and is limited to those users/groups.
+          if (userResults.length > 0 || groupResults.length > 0) {
+            const users = userResults
+              // biome-ignore lint/suspicious/noExplicitAny: API user payload properties
+              .map((u: any) => u.email || u.emailAddress)
+              .filter(Boolean);
+            const groups = groupResults
+              // biome-ignore lint/suspicious/noExplicitAny: API group payload properties
+              .map((g: any) => g.name || g.groupId)
+              .filter(Boolean);
+
+            return {
+              isPublic: false,
+              users,
+              groups,
+            };
+          }
+        }
+      } catch (err) {
+        this.log.warn(
+          { pageId, error: extractErrorMessage(err) },
+          "Failed to fetch page restrictions",
+        );
+      }
+    }
+
+    // 2. If no page or ancestor restrictions, check Space permissions
+    const spaceKey = document.metadata?.spaceKey;
+    if (spaceKey) {
+      try {
+        // biome-ignore lint/suspicious/noExplicitAny: API client response has dynamic/untyped space payload
+        const spaceRes: any = await client.sendRequest(
+          {
+            url: `/api/space/${spaceKey}`,
+            method: "GET",
+            params: {
+              expand: "permissions",
+            },
+          },
+          // biome-ignore lint/suspicious/noExplicitAny: API client accepts any type
+          undefined as any,
+        );
+
+        const permissions = spaceRes?.permissions || [];
+
+        // Check if anonymous has view permission
+        const isAnonymousPublic = permissions.some(
+          // biome-ignore lint/suspicious/noExplicitAny: space permissions are dynamic/untyped
+          (p: any) =>
+            p.anonymousAccess &&
+            p.operation?.operation === "view" &&
+            p.operation?.targetType === "space",
+        );
+
+        if (isAnonymousPublic) {
+          return { isPublic: true };
+        }
+
+        const users: string[] = [];
+        const groups: string[] = [];
+
+        for (const p of permissions) {
+          if (
+            p.operation?.operation === "view" &&
+            p.operation?.targetType === "space"
+          ) {
+            if (p.subjects?.user?.results) {
+              for (const u of p.subjects.user.results) {
+                const email = u.email || u.emailAddress;
+                if (email) users.push(email);
+              }
+            }
+            if (p.subjects?.group?.results) {
+              for (const g of p.subjects.group.results) {
+                const name = g.name;
+                if (name) groups.push(name);
+              }
+            }
+          }
+        }
+
+        return {
+          isPublic: false,
+          users: [...new Set(users)],
+          groups: [...new Set(groups)],
+        };
+      } catch (err) {
+        this.log.warn(
+          { spaceKey, error: extractErrorMessage(err) },
+          "Failed to fetch space permissions",
+        );
+      }
+    }
+
+    // Default to fail-closed
+    return { isPublic: false };
+  }
+
   async *sync(params: {
     config: Record<string, unknown>;
     credentials: ConnectorCredentials;
@@ -169,7 +309,13 @@ export class ConfluenceConnector extends BaseConnector {
             cql,
             cursor,
             limit: batchSize,
-            expand: ["body.storage", "version", "space", "metadata.labels"],
+            expand: [
+              "body.storage",
+              "version",
+              "space",
+              "metadata.labels",
+              "ancestors",
+            ],
           });
         } else {
           // Server/DC: offset-based pagination — the SDK's searchContentByCQL
@@ -182,7 +328,13 @@ export class ConfluenceConnector extends BaseConnector {
                 cql,
                 start,
                 limit: batchSize,
-                expand: ["body.storage", "version", "space", "metadata.labels"],
+                expand: [
+                  "body.storage",
+                  "version",
+                  "space",
+                  "metadata.labels",
+                  "ancestors",
+                ],
               },
             },
             // biome-ignore lint/suspicious/noExplicitAny: SDK requires callback arg
@@ -258,6 +410,149 @@ export class ConfluenceConnector extends BaseConnector {
           "Batch fetch failed",
         );
         throw error;
+      }
+    }
+  }
+
+  async *syncPermissions(params: {
+    config: Record<string, unknown>;
+    credentials: ConnectorCredentials;
+  }) {
+    const config = parseConfluenceConfig(params.config);
+    if (!config) return;
+
+    const client = createConfluenceClient(config, params.credentials, this.log);
+
+    // Fetch page/content permissions in spaces
+    const spaceKeys = config.spaceKeys || [];
+    for (const spaceKey of spaceKeys) {
+      // 1. Get space view permissions
+      let spacePermissions: {
+        users?: string[];
+        groups?: string[];
+        isPublic: boolean;
+      } = { isPublic: false };
+      try {
+        // biome-ignore lint/suspicious/noExplicitAny: API client response has dynamic/untyped space payload
+        const spaceRes: any = await client.sendRequest(
+          {
+            url: `/api/space/${spaceKey}`,
+            method: "GET",
+            params: { expand: "permissions" },
+          },
+          // biome-ignore lint/suspicious/noExplicitAny: API client accepts any type
+          undefined as any,
+        );
+
+        const permissions = spaceRes?.permissions || [];
+        const isAnonymousPublic = permissions.some(
+          // biome-ignore lint/suspicious/noExplicitAny: permission item has dynamic/untyped schema
+          (p: any) =>
+            p.anonymousAccess &&
+            p.operation?.operation === "view" &&
+            p.operation?.targetType === "space",
+        );
+
+        if (isAnonymousPublic) {
+          spacePermissions.isPublic = true;
+        } else {
+          const users: string[] = [];
+          const groups: string[] = [];
+          for (const p of permissions) {
+            if (
+              p.operation?.operation === "view" &&
+              p.operation?.targetType === "space"
+            ) {
+              if (p.subjects?.user?.results) {
+                for (const u of p.subjects.user.results) {
+                  const email = u.email || u.emailAddress;
+                  if (email) users.push(email);
+                }
+              }
+              if (p.subjects?.group?.results) {
+                for (const g of p.subjects.group.results) {
+                  const name = g.name;
+                  if (name) groups.push(name);
+                }
+              }
+            }
+          }
+          spacePermissions = { isPublic: false, users, groups };
+        }
+      } catch (err) {
+        this.log.warn(
+          { spaceKey, error: extractErrorMessage(err) },
+          "Failed to fetch space permissions during permissions sync",
+        );
+        continue;
+      }
+
+      // 2. Fetch pages in space and yield page restrictions
+      try {
+        // biome-ignore lint/suspicious/noExplicitAny: API client response has dynamic/untyped pages payload
+        const pagesRes: any = await client.sendRequest(
+          {
+            url: "/api/content",
+            method: "GET",
+            params: { spaceKey, limit: 100, expand: "ancestors" },
+          },
+          // biome-ignore lint/suspicious/noExplicitAny: API client accepts any type
+          undefined as any,
+        );
+
+        const pages = pagesRes?.results || [];
+        for (const page of pages) {
+          const ancestors = (page.ancestors as Array<{ id: string }>) || [];
+          const pageIdsToCheck = [
+            page.id,
+            ...ancestors.map((a) => a.id).reverse(),
+          ];
+
+          let pagePermissions = { ...spacePermissions };
+
+          for (const pageId of pageIdsToCheck) {
+            // biome-ignore lint/suspicious/noExplicitAny: API client response has dynamic/untyped restriction payload
+            const restrictionRes: any = await client.sendRequest(
+              {
+                url: `/api/content/${pageId}/restriction/byOperation`,
+                method: "GET",
+              },
+              // biome-ignore lint/suspicious/noExplicitAny: API client accepts any type
+              undefined as any,
+            );
+
+            const readRestrictions = restrictionRes?.read;
+            if (readRestrictions?.restrictions) {
+              const userResults =
+                readRestrictions.restrictions.user?.results || [];
+              const groupResults =
+                readRestrictions.restrictions.group?.results || [];
+
+              if (userResults.length > 0 || groupResults.length > 0) {
+                const users = userResults
+                  // biome-ignore lint/suspicious/noExplicitAny: user payload email property
+                  .map((u: any) => u.email || u.emailAddress)
+                  .filter(Boolean);
+                const groups = groupResults
+                  // biome-ignore lint/suspicious/noExplicitAny: group payload name property
+                  .map((g: any) => g.name || g.groupId)
+                  .filter(Boolean);
+                pagePermissions = { isPublic: false, users, groups };
+                break;
+              }
+            }
+          }
+
+          yield {
+            documentId: page.id,
+            permissions: pagePermissions,
+          };
+        }
+      } catch (err) {
+        this.log.warn(
+          { spaceKey, error: extractErrorMessage(err) },
+          "Failed to fetch pages in space during permissions sync",
+        );
       }
     }
   }
@@ -431,6 +726,8 @@ function pageToDocument(
       labels:
         page.metadata?.labels?.results?.map((l: { name: string }) => l.name) ??
         [],
+      ancestors:
+        page.ancestors?.map((a: { id: string }) => ({ id: a.id })) || [],
     },
     updatedAt: page.version?.when ? new Date(page.version.when) : undefined,
   };

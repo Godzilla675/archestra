@@ -6,6 +6,7 @@ import {
   retrieveIdpGroups,
 } from "@/auth/idp-team-sync-cache.ee";
 import { enterpriseTier } from "@/enterprise-tier";
+import { handleTeamOrGroupMappingChange } from "@/knowledge-base/recomputation";
 import logger from "@/logging";
 // Direct imports to avoid circular dependencies when importing from barrel files
 import AccountModel from "@/models/account";
@@ -464,6 +465,12 @@ export async function syncSsoTeams(
         },
         "[syncSsoTeams] SSO team sync completed - memberships changed",
       );
+      handleTeamOrGroupMappingChange(organizationId).catch((err) => {
+        logger.error(
+          { error: err.message, organizationId },
+          "Failed to recompute permissions after SSO team sync",
+        );
+      });
     } else {
       logger.debug(
         { userId, email: userEmail, providerId },

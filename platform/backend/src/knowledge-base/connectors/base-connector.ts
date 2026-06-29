@@ -3,6 +3,7 @@ import defaultLogger from "@/logging";
 import type {
   Connector,
   ConnectorCredentials,
+  ConnectorDocument,
   ConnectorItemFailure,
   ConnectorItemSkipped,
   ConnectorSyncBatch,
@@ -43,6 +44,28 @@ export const REQUEST_TIMEOUT_MS = 30000;
 
 export abstract class BaseConnector implements Connector {
   abstract type: ConnectorType;
+
+  resolveDocumentPermissions?(
+    document: ConnectorDocument,
+    params: {
+      config: Record<string, unknown>;
+      credentials: ConnectorCredentials;
+    },
+  ): Promise<ConnectorDocument["permissions"]>;
+
+  async *syncPermissions?(_params: {
+    config: Record<string, unknown>;
+    credentials: ConnectorCredentials;
+  }): AsyncGenerator<{
+    documentId: string;
+    permissions: {
+      isPublic: boolean;
+      users?: string[];
+      groups?: string[];
+    };
+  }> {
+    // Default implementation does nothing
+  }
 
   protected log: pino.Logger = defaultLogger;
   private rateLimitDelayMs: number;

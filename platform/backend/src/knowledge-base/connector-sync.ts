@@ -12,9 +12,12 @@ import * as metrics from "@/observability/metrics";
 import { taskQueueService } from "@/task-queue";
 import type {
   AclEntry,
+  Connector,
   ConnectorDocument,
   KnowledgeBaseConnector,
+  KnowledgeSourceVisibility,
 } from "@/types";
+import { AclMaterializer } from "./acl-materializer";
 import { chunkDocument } from "./chunker";
 import { resolveConnectorCredentials } from "./connector-credentials";
 import {
@@ -22,6 +25,7 @@ import {
   extractErrorMessage,
 } from "./connectors/base-connector";
 import { getConnector } from "./connectors/registry";
+import { IdentityResolutionService } from "./identity-resolution";
 import { resolveEmbeddingConfig } from "./kb-llm-client";
 import { knowledgeSourceAccessControlService } from "./source-access-control";
 
@@ -55,7 +59,7 @@ class ConnectorSyncService {
     ]);
 
     // Get the connector implementation
-    const connectorImpl = getConnector(connector.connectorType);
+    const connectorImpl = getConnector(connector.connectorType) as BaseConnector;
 
     // Interrupt any stale "running" runs left by previous attempts
     const interrupted =
@@ -153,13 +157,31 @@ class ConnectorSyncService {
         credentials,
         checkpoint: connector.checkpoint as Record<string, unknown> | null,
         embeddingInputModalities,
-      });
+      } as Parameters<Connector["sync"]>[0]);
 
       for await (const batch of syncGenerator) {
         const ingestedDocumentIds: string[] = [];
         for (const doc of batch.documents) {
           documentsProcessed++;
           try {
+            if (
+              connector.visibility === "auto-sync-permissions" &&
+              typeof connectorImpl.resolveDocumentPermissions === "function"
+            ) {
+              try {
+                doc.permissions =
+                  await connectorImpl.resolveDocumentPermissions(doc, {
+                    config: connector.config as Record<string, unknown>,
+                    credentials,
+                  });
+              } catch (err) {
+                runLog.warn(
+                  { docId: doc.id, error: extractErrorMessage(err) },
+                  "Failed to resolve permissions for document",
+                );
+              }
+            }
+
             const result = await this.ingestDocument({
               doc,
               connectorId,
@@ -167,6 +189,8 @@ class ConnectorSyncService {
               organizationId: connector.organizationId,
               acl: documentAcl,
               log: runLog,
+              visibility: connector.visibility,
+              connector,
             });
             if (result.ingested) {
               documentsIngested++;
@@ -385,6 +409,121 @@ class ConnectorSyncService {
     }
   }
 
+  async executePermissionSync(
+    connectorId: string,
+    options?: { logger?: pino.Logger },
+  ): Promise<{
+    status: string;
+    processed: number;
+    updated: number;
+    failed: number;
+  }> {
+    const log = options?.logger ?? defaultLogger;
+    const connector = await KnowledgeBaseConnectorModel.findById(connectorId);
+    if (!connector || connector.visibility !== "auto-sync-permissions") {
+      return { status: "skipped", processed: 0, updated: 0, failed: 0 };
+    }
+
+    const credentials = await resolveConnectorCredentials(connector);
+    const connectorImpl = getConnector(connector.connectorType) as BaseConnector;
+
+    const syncPermissionsFn = connectorImpl.syncPermissions;
+    if (typeof syncPermissionsFn !== "function") {
+      return { status: "not_supported", processed: 0, updated: 0, failed: 0 };
+    }
+
+    log.info({ connectorId }, "Starting lightweight permissions refresh sync");
+    let processed = 0;
+    let updated = 0;
+    let failed = 0;
+
+    const activeDocIds = new Set<string>();
+    const materializer = new AclMaterializer(
+      new IdentityResolutionService(connector.organizationId),
+    );
+
+    try {
+      const gen = syncPermissionsFn.call(connectorImpl, {
+        config: connector.config as Record<string, unknown>,
+        credentials,
+      });
+
+      for await (const item of gen) {
+        processed++;
+        activeDocIds.add(item.documentId);
+
+        // Fetch local document
+        const existing = await KbDocumentModel.findBySourceId({
+          connectorId,
+          sourceId: item.documentId,
+        });
+        if (!existing) continue;
+
+        const resolved = await materializer.materialize(item.permissions);
+        const syncStatus = resolved.complete
+          ? "synced"
+          : "skipped_unresolvable";
+        const syncMetadata = {
+          provider: connector.connectorType,
+          rawPermissions: item.permissions as unknown as Record<
+            string,
+            unknown
+          >,
+          resolvedEmails: resolved.resolvedEmails,
+          skippedGroups: resolved.skippedGroups,
+          lastSyncedAt: new Date().toISOString(),
+        };
+
+        const targetAcl = resolved.complete ? resolved.acl : [];
+        const aclChanged =
+          JSON.stringify(existing.acl) !== JSON.stringify(targetAcl);
+        const statusChanged = existing.permissionSyncStatus !== syncStatus;
+
+        if (aclChanged || statusChanged) {
+          updated++;
+          await KbDocumentModel.update(existing.id, {
+            acl: targetAcl,
+            permissionSyncStatus: syncStatus,
+            permissionSyncMetadata: syncMetadata,
+          });
+          await KbChunkModel.updateAclByDocument(existing.id, targetAcl);
+        }
+      }
+
+      // Fail-closed for orphaned documents (exist locally, but not returned by upstream)
+      const allLocalDocs =
+        await KbDocumentModel.findAllByConnector(connectorId);
+      for (const localDoc of allLocalDocs) {
+        if (localDoc.sourceId && !activeDocIds.has(localDoc.sourceId)) {
+          log.warn(
+            { docId: localDoc.id },
+            "Orphaned document. Bypassing and clearing ACL (fail-closed).",
+          );
+          await KbDocumentModel.update(localDoc.id, {
+            acl: [],
+            permissionSyncStatus: "skipped_unresolvable",
+            permissionSyncMetadata: {
+              provider: connector.connectorType,
+              error: "Document no longer returned by upstream permissions scan",
+              lastSyncedAt: new Date().toISOString(),
+            },
+          });
+          await KbChunkModel.updateAclByDocument(localDoc.id, []);
+          updated++;
+        }
+      }
+
+      return { status: "success", processed, updated, failed };
+    } catch (err) {
+      log.error(
+        { connectorId, error: extractErrorMessage(err) },
+        "Permissions refresh sync failed",
+      );
+      failed = processed;
+      return { status: "failed", processed, updated, failed };
+    }
+  }
+
   /**
    * Ingest a single connector document into kb_documents.
    * Lookup by connectorId + sourceId. Compare contentHash to detect changes.
@@ -397,22 +536,37 @@ class ConnectorSyncService {
     organizationId: string;
     acl: AclEntry[];
     log: pino.Logger;
+    visibility: KnowledgeSourceVisibility;
+    connector: KnowledgeBaseConnector;
   }): Promise<{ ingested: boolean; documentId: string | null }> {
-    const { doc, connectorId, connectorType, organizationId, acl, log } =
-      params;
+    const {
+      doc,
+      connectorId,
+      connectorType,
+      organizationId,
+      acl,
+      log,
+      visibility,
+      connector,
+    } = params;
 
-    // Include media data in hash so unchanged images are properly skipped.
-    const hashInput = doc.mediaContent
-      ? `${doc.mediaContent.mimeType}:${doc.mediaContent.data}` +
-        (doc.metadata
-          ? "\n" +
+    // Include media data and permissions in hash so unchanged content/permissions are properly skipped.
+    const permissionHashString = doc.permissions
+      ? JSON.stringify(doc.permissions)
+      : "";
+    const hashInput =
+      (doc.mediaContent
+        ? `${doc.mediaContent.mimeType}:${doc.mediaContent.data}` +
+          (doc.metadata
+            ? "\n" +
+              JSON.stringify(doc.metadata, Object.keys(doc.metadata).sort())
+            : "")
+        : doc.metadata
+          ? doc.content +
+            "\n" +
             JSON.stringify(doc.metadata, Object.keys(doc.metadata).sort())
-          : "")
-      : doc.metadata
-        ? doc.content +
-          "\n" +
-          JSON.stringify(doc.metadata, Object.keys(doc.metadata).sort())
-        : doc.content;
+          : doc.content) +
+      (permissionHashString ? `\npermissions:${permissionHashString}` : "");
     const contentHash = createHash("sha256").update(hashInput).digest("hex");
 
     // Lookup existing document by connector + source ID
@@ -421,9 +575,104 @@ class ConnectorSyncService {
       sourceId: doc.id,
     });
 
+    let targetAcl = acl;
+    let syncStatus: "synced" | "skipped_unresolvable" = "synced";
+    let syncMetadata: {
+      provider: string;
+      rawPermissions?: Record<string, unknown>;
+      resolvedEmails?: string[];
+      skippedGroups?: string[];
+      lastSyncedAt?: string;
+      error?: string;
+    } | null = null;
+
+    if (visibility === "auto-sync-permissions") {
+      if (!doc.permissions) {
+        log.warn(`Skipping document ${doc.id} - missing permission metadata`);
+        const errMetadata = {
+          provider: connector.connectorType,
+          error: "Missing upstream permission metadata",
+          lastSyncedAt: new Date().toISOString(),
+        };
+        if (existing) {
+          await KbDocumentModel.update(existing.id, {
+            permissionSyncStatus: "skipped_unresolvable",
+            permissionSyncMetadata: errMetadata,
+          });
+          return { ingested: false, documentId: existing.id };
+        } else {
+          const created = await KbDocumentModel.create({
+            organizationId,
+            sourceId: doc.id,
+            connectorId,
+            title: doc.title,
+            content: "",
+            contentHash,
+            sourceUrl: doc.sourceUrl || null,
+            acl: [],
+            metadata: doc.metadata,
+            permissionSyncStatus: "skipped_unresolvable",
+            permissionSyncMetadata: errMetadata,
+          });
+          return { ingested: false, documentId: created.id };
+        }
+      }
+
+      const materializer = new AclMaterializer(
+        new IdentityResolutionService(organizationId),
+      );
+      const resolved = await materializer.materialize({
+        ...doc.permissions,
+        isPublic: doc.permissions.isPublic ?? false,
+      });
+
+      syncMetadata = {
+        provider: connector.connectorType,
+        rawPermissions: doc.permissions,
+        resolvedEmails: resolved.resolvedEmails,
+        skippedGroups: resolved.skippedGroups,
+        lastSyncedAt: new Date().toISOString(),
+      };
+
+      if (!resolved.complete) {
+        log.warn(
+          { docId: doc.id, skippedGroups: resolved.skippedGroups },
+          "Fail-closed check: unmapped groups. Skipping document.",
+        );
+        if (existing) {
+          await KbDocumentModel.update(existing.id, {
+            permissionSyncStatus: "skipped_unresolvable",
+            permissionSyncMetadata: syncMetadata,
+          });
+          return { ingested: false, documentId: existing.id };
+        } else {
+          const created = await KbDocumentModel.create({
+            organizationId,
+            sourceId: doc.id,
+            connectorId,
+            title: doc.title,
+            content: "",
+            contentHash,
+            sourceUrl: doc.sourceUrl || null,
+            acl: [],
+            metadata: doc.metadata,
+            permissionSyncStatus: "skipped_unresolvable",
+            permissionSyncMetadata: syncMetadata,
+          });
+          return { ingested: false, documentId: created.id };
+        }
+      }
+
+      targetAcl = resolved.acl;
+      syncStatus = "synced";
+    }
+
     if (existing) {
       // Same content hash → skip (unchanged)
-      if (existing.contentHash === contentHash) {
+      if (
+        existing.contentHash === contentHash &&
+        existing.permissionSyncStatus !== "skipped_unresolvable"
+      ) {
         const existingChunkCount = await KbChunkModel.countByDocument(
           existing.id,
         );
@@ -436,7 +685,7 @@ class ConnectorSyncService {
             mediaContent: doc.mediaContent,
             metadata: doc.metadata,
             connectorType,
-            acl,
+            acl: targetAcl,
             log,
           });
 
@@ -464,15 +713,17 @@ class ConnectorSyncService {
         return { ingested: false, documentId: null };
       }
 
-      // Content has changed — update existing document
+      // Content has changed or permission was skipped — update existing document
       await KbDocumentModel.update(existing.id, {
         title: doc.title,
         content: doc.content,
         contentHash,
         sourceUrl: doc.sourceUrl ?? null,
-        acl,
+        acl: targetAcl,
         metadata: doc.metadata,
         embeddingStatus: "pending",
+        permissionSyncStatus: syncStatus,
+        permissionSyncMetadata: syncMetadata,
       });
 
       // Re-chunk: content changed, so replace stale chunks
@@ -484,7 +735,7 @@ class ConnectorSyncService {
         mediaContent: doc.mediaContent,
         metadata: doc.metadata,
         connectorType,
-        acl,
+        acl: targetAcl,
         log,
       });
 
@@ -507,8 +758,10 @@ class ConnectorSyncService {
       content: doc.content,
       contentHash,
       sourceUrl: doc.sourceUrl,
-      acl,
+      acl: targetAcl,
       metadata: doc.metadata,
+      permissionSyncStatus: syncStatus,
+      permissionSyncMetadata: syncMetadata,
     });
 
     await this.chunkAndStore({
@@ -518,7 +771,7 @@ class ConnectorSyncService {
       mediaContent: doc.mediaContent,
       metadata: doc.metadata,
       connectorType,
-      acl,
+      acl: targetAcl,
       log,
     });
 
