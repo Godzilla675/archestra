@@ -54,6 +54,8 @@ export function getConnector(type: string): Connector {
 export const CONNECTOR_TYPES_SUPPORTING_AUTO_SYNC_PERMISSIONS: ReadonlySet<ConnectorType> =
   new Set<ConnectorType>(["jira", "confluence"]);
 
-export function connectorSupportsAutoSyncPermissions(type: ConnectorType): boolean {
+export function connectorSupportsAutoSyncPermissions(
+  type: ConnectorType,
+): boolean {
   return CONNECTOR_TYPES_SUPPORTING_AUTO_SYNC_PERMISSIONS.has(type);
 }

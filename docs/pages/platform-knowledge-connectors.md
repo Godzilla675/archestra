@@ -57,7 +57,9 @@ Permissions are automatically recomputed when:
 - Team memberships change (members added or removed).
 - External group mappings on a team are updated.
 
-No manual re-sync of the connector is required for permission changes to take effect.
+Recomputation runs as a background task shortly after the change, so there may be a brief delay (typically a few seconds) before the new ACL takes effect. No manual re-sync of the connector is required.
+
+If you change a connector's visibility to **Auto-sync permissions** after documents have already been ingested, those documents will not retroactively receive ACLs until the next connector sync runs (permission extraction only happens during a full sync, not on visibility change). Run a sync after switching the visibility mode to populate ACLs on existing documents.
 
 ### Enterprise Feature
 

@@ -7,8 +7,8 @@ import {
 } from "@/models";
 import { taskQueueService } from "@/task-queue";
 import type { AclEntry } from "@/types";
-import { AclMaterializer } from "./acl-materializer";
 import type { UpstreamPermissions } from "./acl-materializer";
+import { AclMaterializer } from "./acl-materializer";
 import { IdentityResolutionService } from "./identity-resolution";
 
 /**
@@ -116,16 +116,20 @@ export async function recomputeConnectorPermissions(
 export async function handleTeamOrGroupMappingChange(
   organizationId: string,
 ): Promise<void> {
+  // Single query: select id + visibility for every connector in the org so we
+  // can filter in JS without re-fetching each connector individually.
   const connectors = await db
-    .select({ id: schema.knowledgeBaseConnectorsTable.id })
+    .select({
+      id: schema.knowledgeBaseConnectorsTable.id,
+      visibility: schema.knowledgeBaseConnectorsTable.visibility,
+    })
     .from(schema.knowledgeBaseConnectorsTable)
     .where(
       eq(schema.knowledgeBaseConnectorsTable.organizationId, organizationId),
     );
 
   for (const connector of connectors) {
-    const full = await KnowledgeBaseConnectorModel.findById(connector.id);
-    if (full?.visibility !== "auto-sync-permissions") continue;
+    if (connector.visibility !== "auto-sync-permissions") continue;
 
     await taskQueueService.enqueue({
       taskType: "connector_permission_recompute",

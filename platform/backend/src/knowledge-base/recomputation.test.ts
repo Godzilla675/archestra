@@ -2,9 +2,9 @@ import { describe, expect, vi } from "vitest";
 import { KbDocumentModel, TeamModel } from "@/models";
 import { taskQueueService } from "@/task-queue";
 import { test } from "@/test";
-import { recomputeConnectorPermissions } from "./recomputation";
 import {
   handleTeamOrGroupMappingChange,
+  recomputeConnectorPermissions,
 } from "./recomputation";
 
 describe("recomputeConnectorPermissions", () => {
@@ -321,12 +321,8 @@ describe("handleTeamOrGroupMappingChange", () => {
       ]);
 
       // Auto-sync connector's doc should be updated
-      const updatedAutoSyncDoc = await KbDocumentModel.findById(
-        docAutoSync.id,
-      );
-      expect(updatedAutoSyncDoc?.acl).toEqual([
-        "user_email:user1@example.com",
-      ]);
+      const updatedAutoSyncDoc = await KbDocumentModel.findById(docAutoSync.id);
+      expect(updatedAutoSyncDoc?.acl).toEqual(["user_email:user1@example.com"]);
       expect(updatedAutoSyncDoc?.permissionSyncStatus).toBe("synced");
 
       // Org connector's doc should remain unchanged (not an auto-sync connector,

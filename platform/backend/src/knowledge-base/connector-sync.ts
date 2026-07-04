@@ -59,7 +59,9 @@ class ConnectorSyncService {
     ]);
 
     // Get the connector implementation
-    const connectorImpl = getConnector(connector.connectorType) as BaseConnector;
+    const connectorImpl = getConnector(
+      connector.connectorType,
+    ) as BaseConnector;
 
     // Interrupt any stale "running" runs left by previous attempts
     const interrupted =
@@ -425,7 +427,9 @@ class ConnectorSyncService {
     }
 
     const credentials = await resolveConnectorCredentials(connector);
-    const connectorImpl = getConnector(connector.connectorType) as BaseConnector;
+    const connectorImpl = getConnector(
+      connector.connectorType,
+    ) as BaseConnector;
 
     const syncPermissionsFn = connectorImpl.syncPermissions;
     if (typeof syncPermissionsFn !== "function") {

@@ -7,9 +7,9 @@ import type { Team } from "@/types";
  * Resolves upstream permission identifiers (user emails, group names) to
  * Archestra member emails within a single organization.
  *
- * Both methods use indexed `inArray` / `ilike` queries against the DB so we
- * never load the entire org roster into memory, and never run an N+1 fan-out
- * over groups/tiers.
+ * Both methods use a small constant number of batched queries
+ * (`inArray` / `LOWER(...) IN (...)`) so we never load the entire org roster
+ * into memory, and never run an N+1 fan-out over groups / teams.
  */
 export class IdentityResolutionService {
   private orgId: string;
@@ -87,13 +87,13 @@ export class IdentityResolutionService {
       return { resolvedEmails: [], unmappedGroups: [] };
     }
 
-    const normalizedGroups = [
-      ...new Set(groupIds.map((g) => g.toLowerCase())),
-    ];
+    const normalizedGroups = [...new Set(groupIds.map((g) => g.toLowerCase()))];
 
     // Single batched query: group -> teams[]
-    const groupToTeams =
-      await TeamModel.findTeamsByExternalGroups(this.orgId, normalizedGroups);
+    const groupToTeams = await TeamModel.findTeamsByExternalGroups(
+      this.orgId,
+      normalizedGroups,
+    );
 
     // `findTeamsByExternalGroups` filters inArray on the normalized (lowercase)
     // input, but keys its returned map by the DB-stored `group_identifier`,
