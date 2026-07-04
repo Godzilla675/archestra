@@ -1,9 +1,10 @@
 import { describe, expect, vi } from "vitest";
 import { KbDocumentModel, TeamModel } from "@/models";
+import { taskQueueService } from "@/task-queue";
 import { test } from "@/test";
+import { recomputeConnectorPermissions } from "./recomputation";
 import {
   handleTeamOrGroupMappingChange,
-  recomputeConnectorPermissions,
 } from "./recomputation";
 
 describe("recomputeConnectorPermissions", () => {
@@ -286,16 +287,54 @@ describe("handleTeamOrGroupMappingChange", () => {
     await TeamModel.addExternalGroup(team.id, "ext-group-mapping");
     await makeTeamMember(team.id, user1.id);
 
-    // Trigger recomputation for the org
-    await handleTeamOrGroupMappingChange(org.id);
+    // `handleTeamOrGroupMappingChange` enqueues a background
+    // `connector_permission_recompute` task per auto-sync connector rather
+    // than running synchronously in the request path. Stub the enqueue so it
+    // immediately runs `recomputeConnectorPermissions` (emulating the worker)
+    // and records the calls so we can assert the right tasks were enqueued.
+    const enqueuedTasks: {
+      taskType: string;
+      connectorId: string;
+    }[] = [];
+    const enqueueSpy = vi
+      .spyOn(taskQueueService, "enqueue")
+      .mockImplementation(async (params) => {
+        const connectorId = params.payload.connectorId as string;
+        enqueuedTasks.push({ taskType: params.taskType, connectorId });
+        if (params.taskType === "connector_permission_recompute") {
+          await recomputeConnectorPermissions(connectorId);
+        }
+        return "test-task-id";
+      });
 
-    // Auto-sync connector's doc should be updated
-    const updatedAutoSyncDoc = await KbDocumentModel.findById(docAutoSync.id);
-    expect(updatedAutoSyncDoc?.acl).toEqual(["user_email:user1@example.com"]);
-    expect(updatedAutoSyncDoc?.permissionSyncStatus).toBe("synced");
+    try {
+      // Trigger recomputation for the org.
+      await handleTeamOrGroupMappingChange(org.id);
 
-    // Org connector's doc should remain unchanged (not an auto-sync connector)
-    const updatedOrgDoc = await KbDocumentModel.findById(docOrg.id);
-    expect(updatedOrgDoc?.acl).toEqual(["org:*"]);
+      // Exactly one recompute task should have been enqueued, for the
+      // auto-sync connector only — not for the org-wide connector.
+      expect(enqueuedTasks).toEqual([
+        {
+          taskType: "connector_permission_recompute",
+          connectorId: autoSyncConnector.id,
+        },
+      ]);
+
+      // Auto-sync connector's doc should be updated
+      const updatedAutoSyncDoc = await KbDocumentModel.findById(
+        docAutoSync.id,
+      );
+      expect(updatedAutoSyncDoc?.acl).toEqual([
+        "user_email:user1@example.com",
+      ]);
+      expect(updatedAutoSyncDoc?.permissionSyncStatus).toBe("synced");
+
+      // Org connector's doc should remain unchanged (not an auto-sync connector,
+      // so no recompute task was enqueued for it and its ACL was untouched).
+      const updatedOrgDoc = await KbDocumentModel.findById(docOrg.id);
+      expect(updatedOrgDoc?.acl).toEqual(["org:*"]);
+    } finally {
+      enqueueSpy.mockRestore();
+    }
   });
 });

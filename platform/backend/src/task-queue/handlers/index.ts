@@ -3,6 +3,7 @@ import { handleAuditLogCleanup } from "./audit-log-cleanup-handler";
 import { handleBatchEmbedding } from "./batch-embedding-handler";
 import { handleCheckDueConnectors } from "./check-due-connectors-handler";
 import { handleCheckDueScheduleTriggers } from "./check-due-schedule-triggers-handler";
+import { handleConnectorPermissionRecompute } from "./connector-permission-recompute-handler";
 import { handleConnectorPermissionSync } from "./connector-permission-sync-handler";
 import { handleConnectorSync } from "./connector-sync-handler";
 import { handleScheduleTriggerRunExecution } from "./schedule-trigger-run-handler";
@@ -12,6 +13,10 @@ export function registerTaskHandlers(taskQueueService: TaskQueueService): void {
   taskQueueService.registerHandler(
     "connector_permission_sync",
     handleConnectorPermissionSync,
+  );
+  taskQueueService.registerHandler(
+    "connector_permission_recompute",
+    handleConnectorPermissionRecompute,
   );
   taskQueueService.registerHandler("batch_embedding", handleBatchEmbedding);
   taskQueueService.registerHandler(

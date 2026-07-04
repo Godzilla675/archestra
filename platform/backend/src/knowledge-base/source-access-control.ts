@@ -181,6 +181,16 @@ class KnowledgeSourceAccessControlService {
     // SPDX-SnippetBegin
     // SPDX-SnippetCopyrightText: 2026 Archestra Inc.
     // SPDX-License-Identifier: LicenseRef-Archestra-Enterprise
+    // Only team-scoped connectors are restricted at the connector level.
+    //
+    // `auto-sync-permissions` connectors are intentionally NOT restricted here:
+    // visibility into the connector itself (name, config, document list) is
+    // org-wide, and access control is enforced per-document via the
+    // materialized `acl` column. Treating it like team-scoped here would make
+    // the connector invisible to non-admins, defeating the per-doc model.
+    // Treat any unknown / future visibility (other than team-scoped) the same
+    // way: visible at the connector level, restricted at the document level
+    // via ACLs.
     if (source.visibility !== "team-scoped") {
       return true;
     }

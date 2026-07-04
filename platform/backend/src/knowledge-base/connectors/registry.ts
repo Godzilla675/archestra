@@ -42,3 +42,18 @@ export function getConnector(type: string): Connector {
   }
   return factory();
 }
+
+/**
+ * Connector types that implement `resolveDocumentPermissions` +
+ * `syncPermissions`, and therefore can honor the `auto-sync-permissions`
+ * visibility mode. Keeping this list explicit (rather than duck-typing at
+ * runtime) means the route layer can reject unsupported combinations before
+ * any documents are ingested, instead of silently fail-closing every
+ * document on the first permission sync.
+ */
+export const CONNECTOR_TYPES_SUPPORTING_AUTO_SYNC_PERMISSIONS: ReadonlySet<ConnectorType> =
+  new Set<ConnectorType>(["jira", "confluence"]);
+
+export function connectorSupportsAutoSyncPermissions(type: ConnectorType): boolean {
+  return CONNECTOR_TYPES_SUPPORTING_AUTO_SYNC_PERMISSIONS.has(type);
+}

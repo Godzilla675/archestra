@@ -476,7 +476,8 @@ class ConnectorSyncService {
 
         const targetAcl = resolved.complete ? resolved.acl : [];
         const aclChanged =
-          JSON.stringify(existing.acl) !== JSON.stringify(targetAcl);
+          JSON.stringify([...(existing.acl ?? [])].sort()) !==
+          JSON.stringify([...targetAcl].sort());
         const statusChanged = existing.permissionSyncStatus !== syncStatus;
 
         if (aclChanged || statusChanged) {
@@ -497,7 +498,7 @@ class ConnectorSyncService {
         if (localDoc.sourceId && !activeDocIds.has(localDoc.sourceId)) {
           log.warn(
             { docId: localDoc.id },
-            "Orphaned document. Bypassing and clearing ACL (fail-closed).",
+            "Orphaned document: no longer returned by upstream permissions scan. Revoking access (fail-closed, ACL cleared).",
           );
           await KbDocumentModel.update(localDoc.id, {
             acl: [],

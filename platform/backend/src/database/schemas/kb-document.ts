@@ -33,10 +33,13 @@ const kbDocumentsTable = pgTable(
       .notNull()
       .default("pending"),
     chunkCount: integer("chunk_count").notNull().default(0),
-    permissionSyncStatus: text("permission_sync_status")
-      .$type<"synced" | "skipped_unresolvable">()
-      .notNull()
-      .default("synced"),
+    // Nullable: documents that predate auto-sync-permissions, or were
+    // never synced (skipped because the connector is org-wide / team-scoped),
+    // have no permission sync status. Recomputation uses `null` to mean
+    // "doc is not managed by auto-sync — skip it".
+    permissionSyncStatus: text("permission_sync_status").$type<
+      "synced" | "skipped_unresolvable"
+    >(),
     permissionSyncMetadata: jsonb("permission_sync_metadata").$type<{
       provider: string;
       rawPermissions?: Record<string, unknown>;

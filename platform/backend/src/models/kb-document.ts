@@ -209,14 +209,15 @@ class KbDocumentModel {
   static async create(data: InsertKbDocument): Promise<KbDocument> {
     const insertData = {
       ...data,
-      permissionSyncStatus: data.permissionSyncStatus as "synced" | "skipped_unresolvable" | undefined,
+      permissionSyncStatus:
+        data.permissionSyncStatus ?? null,
     } as typeof schema.kbDocumentsTable.$inferInsert;
 
     const [result] = await db
       .insert(schema.kbDocumentsTable)
       .values(insertData)
       .returning();
- 
+
     return result as KbDocument;
   }
 
@@ -226,7 +227,8 @@ class KbDocumentModel {
   ): Promise<KbDocument | null> {
     const updateData = {
       ...data,
-      permissionSyncStatus: data.permissionSyncStatus as "synced" | "skipped_unresolvable" | undefined,
+      permissionSyncStatus:
+        data.permissionSyncStatus ?? null,
     } as typeof schema.kbDocumentsTable.$inferInsert;
 
     const [result] = await db
@@ -234,7 +236,7 @@ class KbDocumentModel {
       .set(updateData)
       .where(eq(schema.kbDocumentsTable.id, id))
       .returning();
- 
+
     return result as KbDocument | null;
   }
 

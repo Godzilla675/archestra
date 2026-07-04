@@ -15,6 +15,7 @@ import {
   knowledgeSourceAccessControlService,
 } from "@/knowledge-base";
 import { resolveConnectorCredentials } from "@/knowledge-base/connector-credentials";
+import { connectorSupportsAutoSyncPermissions } from "@/knowledge-base/connectors/registry";
 import { getConnector } from "@/knowledge-base/connectors/registry";
 import logger from "@/logging";
 import {
@@ -526,6 +527,15 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
           "Auto-sync permissions requires an Enterprise license",
         );
       }
+      if (
+        visibility === "auto-sync-permissions" &&
+        !connectorSupportsAutoSyncPermissions(body.connectorType)
+      ) {
+        throw new ApiError(
+          400,
+          `Auto-sync permissions is not supported for connector type "${body.connectorType}". Supported types: jira, confluence.`,
+        );
+      }
       // SPDX-SnippetEnd
 
       // Validate connector config
@@ -860,6 +870,15 @@ const knowledgeBaseRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(
           403,
           "Auto-sync permissions requires an Enterprise license",
+        );
+      }
+      if (
+        nextVisibility === "auto-sync-permissions" &&
+        !connectorSupportsAutoSyncPermissions(connector.connectorType)
+      ) {
+        throw new ApiError(
+          400,
+          `Auto-sync permissions is not supported for connector type "${connector.connectorType}". Supported types: jira, confluence.`,
         );
       }
       // SPDX-SnippetEnd
