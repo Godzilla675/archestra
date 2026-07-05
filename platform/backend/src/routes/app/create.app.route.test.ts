@@ -1,32 +1,15 @@
 import { ADMIN_ROLE_NAME } from "@archestra/shared";
-import config from "@/config";
 import { AppVersionModel } from "@/models";
 import EnvironmentModel from "@/models/environment";
 import type { FastifyInstanceWithZod } from "@/server";
 import { createFastifyInstance } from "@/server";
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  test,
-} from "@/test";
+import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
 
 describe("POST /api/apps", () => {
   let app: FastifyInstanceWithZod;
   let organizationId: string;
   let user: User;
-
-  const appsEnabled = config.apps.enabled;
-  beforeAll(() => {
-    (config.apps as { enabled: boolean }).enabled = true;
-  });
-  afterAll(() => {
-    (config.apps as { enabled: boolean }).enabled = appsEnabled;
-  });
 
   beforeEach(async ({ makeOrganization, makeUser, makeMember }) => {
     const organization = await makeOrganization();
@@ -74,7 +57,7 @@ describe("POST /api/apps", () => {
     });
   });
 
-  test("seeds the default template server-side when html is omitted", async () => {
+  test("seeds the default template server-side with the app name when html is omitted", async () => {
     const created = await app.inject({
       method: "POST",
       url: "/api/apps",
@@ -86,10 +69,10 @@ describe("POST /api/apps", () => {
       method: "GET",
       url: `/api/apps/${created.json().id}/versions`,
     });
-    expect(versions.json()[0].html).toContain(
-      "window.archestra.storage.user.set",
-    );
-    expect(versions.json()[0].html).toContain("window.archestra.tools.call");
+    const { html } = versions.json()[0];
+    expect(html).toContain("<title>Seeded</title>");
+    expect(html).toContain("<h1>Seeded</h1>");
+    expect(html).not.toContain("{{APP_NAME}}");
   });
 
   test("rejects SDK self-bootstrap html and surfaces soft warnings", async () => {

@@ -30,6 +30,7 @@ import logger from "@/logging";
 import { getActiveSessionId } from "@/observability/request-context";
 import { captureRawProviderErrorInSentry } from "@/observability/sentry";
 import { LlmProviderAuthRequiredError } from "@/utils/llm-provider-auth-error";
+import { ContextWindowExceededError } from "./normalization/enforce-context-window-limit";
 import { RequestTooLargeError } from "./normalization/enforce-request-size-limit";
 
 // =============================================================================
@@ -311,7 +312,7 @@ function extractArchestraInternalCode(
     const parsed = JSON.parse(responseBody);
     const code = parsed?.error?.internal_code;
     if (code === ArchestraInternalErrorCode.ContextLengthExceeded) {
-      return ArchestraInternalErrorCode.ContextLengthExceeded;
+      return code;
     }
   } catch {
     // Not JSON — fall through.
@@ -1518,6 +1519,17 @@ export function mapProviderError(
     };
   }
 
+  // Prompt assembled larger than the model's context window, caught pre-flight
+  // by the token-budget gate → an actionable "too long" message naming the
+  // estimate and the limit, instead of the provider's generic rejection.
+  if (error instanceof ContextWindowExceededError) {
+    return {
+      code: ChatErrorCode.ContextTooLong,
+      message: error.message,
+      isRetryable: false,
+    };
+  }
+
   // Per-user provider with no linked account → an actionable "connect" prompt,
   // not a generic key error. Carries authAction so the UI renders a link card.
   if (error instanceof LlmProviderAuthRequiredError) {
@@ -1680,6 +1692,15 @@ export function mapProviderError(
     errorCode = ChatErrorCode.ContextTooLong;
   }
   const usageLimitError = extractUsageLimitError(responseBody);
+  // An Archestra usage-limit block arrives over the proxy envelope as an HTTP
+  // 429, which the per-provider mappers classify as a retryable RateLimit. That
+  // mislabels it as the provider throttling traffic ("not your usage limit" in
+  // some clients) and offers a pointless retry. Reclassify it to the dedicated,
+  // non-retryable UsageLimitExceeded code so the UI attributes it to Archestra
+  // and drops the retry affordance.
+  if (usageLimitError) {
+    errorCode = ChatErrorCode.UsageLimitExceeded;
+  }
 
   // Extract the most meaningful error message
   const errorMessage = extractErrorMessage(parsedError, responseBody, error);
@@ -1820,7 +1841,10 @@ export function sanitizeChatErrorForFrontend(
 
 function formatUsageLimitMessage(entityType: string | undefined): string {
   if (!entityType) {
-    return "A usage limit budget has been exceeded.";
+    return "Archestra blocked this request because a configured usage limit has been reached.";
   }
-  return `The ${entityType.replace(/_/g, " ")} usage limit budget has been exceeded.`;
+  return `Archestra blocked this request because the ${entityType.replace(
+    /_/g,
+    " ",
+  )} usage limit has been reached.`;
 }

@@ -62,7 +62,6 @@ import {
   type RemoteServerInstallResult,
 } from "../../_parts/remote-server-install-dialog";
 import type { McpServerInstallScope } from "../../_parts/select-mcp-server-credential-type-and-teams";
-import { AppBackingCard } from "./app-backing-card";
 import { ManageUsersDialog } from "./manage-users-dialog";
 import {
   type CatalogItem,
@@ -96,11 +95,8 @@ export function InternalMCPCatalog({
   // Get search query from URL
   const searchQueryFromUrl = searchParams.get("search") || "";
 
-  // includeApps surfaces owned-app backings so the registry can manage them;
-  // the SSR fetch in page.tsx seeds the matching ("with-apps") query key.
   const { data: catalogItems } = useInternalMcpCatalog({
     initialData,
-    includeApps: true,
   });
   const { data: installedServers } = useMcpServers({
     initialData: initialInstalledServers,
@@ -321,8 +317,12 @@ export function InternalMCPCatalog({
       }
 
       window.location.href = authorizationUrl;
-    } catch {
-      toast.error("Failed to initiate OAuth flow");
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to initiate OAuth flow",
+      );
     }
   };
 
@@ -922,9 +922,6 @@ export function InternalMCPCatalog({
             </h3>
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
               {personalItems.map((item) => {
-                if (item.serverType === "app") {
-                  return <AppBackingCard key={item.id} item={item} />;
-                }
                 const serverInfo = getInstalledServerInfo(item);
                 return (
                   <McpServerCard
@@ -971,9 +968,6 @@ export function InternalMCPCatalog({
             )}
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
               {sharedItems.map((item) => {
-                if (item.serverType === "app") {
-                  return <AppBackingCard key={item.id} item={item} />;
-                }
                 const serverInfo = getInstalledServerInfo(item);
                 return (
                   <McpServerCard

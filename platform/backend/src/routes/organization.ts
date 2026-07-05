@@ -41,6 +41,7 @@ import {
   constructResponseSchema,
   type NetworkPolicy,
   SelectOrganizationSchema,
+  type TrustedImageRegistries,
   UpdateAgentSettingsSchema,
   UpdateAppearanceSettingsSchema,
   UpdateAuthSettingsSchema,
@@ -137,7 +138,7 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
       schema: {
         operationId: RouteId.UpdateSecuritySettings,
         description:
-          "Update security settings (global tool policy, chat file uploads, tool auto-assignment)",
+          "Update security settings (default tool guardrails, chat file uploads)",
         tags: ["Organization"],
         body: UpdateSecuritySettingsSchema,
         response: constructResponseSchema(SelectOrganizationSchema),
@@ -231,18 +232,6 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         const agent = await AgentModel.findById(body.defaultAgentId);
         if (!agent || agent.organizationId !== organizationId) {
           throw new ApiError(404, "Agent not found");
-        }
-      }
-
-      // Skill slash commands inject skill content that points at load_skill,
-      // so they require the skill tools to be enabled for the organization.
-      if (body.skillSlashCommandsEnabled === true) {
-        const currentOrg = await OrganizationModel.getById(organizationId);
-        if (!currentOrg?.skillToolsEnabled) {
-          throw new ApiError(
-            400,
-            "Enable skills for this organization before exposing them as slash commands",
-          );
         }
       }
 
@@ -373,6 +362,7 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
         defaultNetworkPolicy: typeof body.networkPolicy;
         defaultEnvironmentRestricted: boolean;
         defaultEnvironmentValidationRegex: string | null;
+        defaultEnvironmentTrustedImageRegistries: TrustedImageRegistries | null;
       }> = {};
       if ("name" in body) {
         data.defaultEnvironmentName = body.name ?? null;
@@ -391,6 +381,10 @@ const organizationRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
       if ("validationRegex" in body) {
         data.defaultEnvironmentValidationRegex = body.validationRegex ?? null;
+      }
+      if ("trustedImageRegistries" in body) {
+        data.defaultEnvironmentTrustedImageRegistries =
+          body.trustedImageRegistries ?? null;
       }
 
       const organization = await OrganizationModel.patch(organizationId, data);

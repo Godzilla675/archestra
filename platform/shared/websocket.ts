@@ -347,6 +347,10 @@ export type McpDeploymentStatusEntry = {
   restartCount?: number;
   podAge?: string; // e.g. "24m", "2h", "3d"
   podName?: string;
+  // Stable per-deployment identity, known at install time (before a pod is
+  // scheduled). Multi-tenant catalogs share one deployment across rows, so the
+  // UI dedupes by this to count pods, not caller rows.
+  deploymentName?: string;
 };
 
 export type McpDeploymentStatusesMessage = {
@@ -385,6 +389,18 @@ export type ErrorMessage = {
   };
 };
 
+/**
+ * Sent to a conversation's owner when a message lands in it, so the sidebar
+ * refreshes its new-messages indicator even when the client was not attached
+ * to the stream (e.g. it navigated away before the response finished).
+ */
+export type ConversationUpdatedMessage = {
+  type: "conversation_updated";
+  payload: {
+    conversationId: string;
+  };
+};
+
 export type ServerWebSocketMessage =
   | BrowserScreenshotMessage
   | BrowserNavigateResultMessage
@@ -404,6 +420,7 @@ export type ServerWebSocketMessage =
   | McpExecClosedMessage
   | McpDeploymentStatusesMessage
   | McpInstallationStatusMessage
+  | ConversationUpdatedMessage
   | ErrorMessage;
 
 /**

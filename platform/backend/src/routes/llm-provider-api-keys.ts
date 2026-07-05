@@ -10,12 +10,14 @@ import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import { capitalize } from "lodash-es";
 import { z } from "zod";
 import { hasPermission, userHasPermission } from "@/auth";
+import { anthropicWorkloadIdentity } from "@/clients/anthropic-workload-identity";
 import { isAzureOpenAiEntraIdEnabled } from "@/clients/azure-openai-credentials";
 import {
   type BedrockSigV4Credentials,
   encodeBedrockSigV4Marker,
 } from "@/clients/bedrock-credentials";
 import { isVertexAiEnabled } from "@/clients/gemini-client";
+import config from "@/config";
 import logger from "@/logging";
 import {
   LlmOauthClientModel,
@@ -44,6 +46,8 @@ import {
   SelectLlmProviderApiKeySchema,
   type SelectSecret,
 } from "@/types";
+import { isUniqueConstraintError } from "@/utils/db";
+import { dockerLocalhostConnectionHint } from "@/utils/docker-localhost-hint";
 
 async function testApiKeyOrThrow(
   provider: SupportedProvider,
@@ -54,11 +58,60 @@ async function testApiKeyOrThrow(
   try {
     await testProviderApiKey(provider, apiKey, baseUrl, extraHeaders);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const hint = dockerLocalhostConnectionHint({
+      baseUrl: effectiveBaseUrlForHint(provider, baseUrl),
+      errorMessage: message,
+    });
     throw new ApiError(
       400,
-      `Invalid API key: Failed to connect to ${capitalize(provider)}: ${error instanceof Error ? error.message : String(error)}`,
+      `Invalid API key: Failed to connect to ${capitalize(provider)}: ${message}${hint ? ` ${hint}` : ""}`,
     );
   }
+}
+
+/**
+ * Verifies connectivity for optional-key providers (Ollama, vLLM) when no API
+ * key was supplied. Unlike {@link testApiKeyOrThrow}, an empty model list is
+ * treated as success: the server is reachable, the user simply hasn't pulled
+ * any models yet, so we shouldn't block key creation. Genuine connection
+ * failures still throw — with a Docker localhost hint when applicable.
+ */
+async function testKeylessConnectivityOrThrow(
+  provider: SupportedProvider,
+  baseUrl?: string | null,
+  extraHeaders?: Record<string, string> | null,
+): Promise<void> {
+  try {
+    await testProviderApiKey(provider, "", baseUrl, extraHeaders);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("Models list is empty")) return;
+    const hint = dockerLocalhostConnectionHint({
+      baseUrl: effectiveBaseUrlForHint(provider, baseUrl),
+      errorMessage: message,
+    });
+    throw new ApiError(
+      400,
+      `Failed to connect to ${capitalize(provider)}: ${message}${hint ? ` ${hint}` : ""}`,
+    );
+  }
+}
+
+/**
+ * The base URL connectivity is actually tested against: an explicit override if
+ * present, otherwise the provider's configured default. Needed so the Docker
+ * hint fires when an Ollama key is created with no Base URL (the default points
+ * at localhost).
+ */
+function effectiveBaseUrlForHint(
+  provider: SupportedProvider,
+  baseUrl: string | null | undefined,
+): string | null {
+  if (baseUrl) return baseUrl;
+  if (provider === "ollama") return config.llm.ollama.baseUrl ?? null;
+  if (provider === "vllm") return config.llm.vllm.baseUrl ?? null;
+  return null;
 }
 
 async function testKeylessAzureEntraOrThrow(
@@ -250,6 +303,7 @@ const llmProviderApiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
                 isProviderApiKeyOptional({
                   provider: data.provider,
                   azureEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
+                  anthropicWifEnabled: anthropicWorkloadIdentity.isEnabled(),
                 }) || data.apiKey
               );
             },
@@ -402,6 +456,36 @@ const llmProviderApiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
             body.extraHeaders,
           );
         }
+      } else if (
+        body.provider === "anthropic" &&
+        !actualApiKeyValue &&
+        anthropicWorkloadIdentity.isEnabled()
+      ) {
+        // Keyless Anthropic key backed by Workload Identity Federation —
+        // exercises the token exchange and model listing end to end.
+        await testApiKeyOrThrow(
+          body.provider,
+          "",
+          runtimeTestBaseUrl,
+          body.extraHeaders,
+        );
+      } else if (
+        !actualApiKeyValue &&
+        isProviderApiKeyOptional({
+          provider: body.provider,
+          // azure is handled by the keyless Entra branch above; only the
+          // always-optional self-hosted providers (Ollama, vLLM) fall here.
+          azureEntraIdEnabled: false,
+        })
+      ) {
+        // No API key for a self-hosted provider — still verify connectivity so
+        // connection errors (e.g. the Docker localhost trap) surface with a
+        // helpful hint instead of silently creating an unusable key.
+        await testKeylessConnectivityOrThrow(
+          body.provider,
+          runtimeTestBaseUrl,
+          body.extraHeaders,
+        );
       }
 
       if (
@@ -409,6 +493,7 @@ const llmProviderApiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
         !isProviderApiKeyOptional({
           provider: body.provider,
           azureEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
+          anthropicWifEnabled: anthropicWorkloadIdentity.isEnabled(),
         })
       ) {
         throw new ApiError(
@@ -417,20 +502,35 @@ const llmProviderApiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
         );
       }
 
-      // Create the API key record
-      const createdApiKey = await LlmProviderApiKeyModel.create({
-        organizationId,
-        name: body.name,
-        provider: body.provider,
-        secretId: secret?.id ?? null,
-        baseUrl: body.baseUrl ?? null,
-        inferenceBaseUrl: body.inferenceBaseUrl ?? null,
-        extraHeaders: body.extraHeaders ?? null,
-        scope: body.scope,
-        userId: body.scope === "personal" ? user.id : null,
-        teamId: body.scope === "team" ? body.teamId : null,
-        isPrimary: body.isPrimary ?? false,
-      });
+      // Create the API key record. The model demotes the current primary in
+      // the same transaction; a unique violation here means a concurrent
+      // writer won the race — surface it as a conflict, not a 500.
+      let createdApiKey: Awaited<
+        ReturnType<typeof LlmProviderApiKeyModel.create>
+      >;
+      try {
+        createdApiKey = await LlmProviderApiKeyModel.create({
+          organizationId,
+          name: body.name,
+          provider: body.provider,
+          secretId: secret?.id ?? null,
+          baseUrl: body.baseUrl ?? null,
+          inferenceBaseUrl: body.inferenceBaseUrl ?? null,
+          extraHeaders: body.extraHeaders ?? null,
+          scope: body.scope,
+          userId: body.scope === "personal" ? user.id : null,
+          teamId: body.scope === "team" ? body.teamId : null,
+          isPrimary: body.isPrimary ?? false,
+        });
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          throw new ApiError(
+            409,
+            "Another primary key for this provider and scope was set concurrently. Please retry.",
+          );
+        }
+        throw error;
+      }
 
       // Sync models for the new API key before returning so the frontend
       // can immediately show available models after creation.
@@ -440,6 +540,7 @@ const llmProviderApiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
         isProviderApiKeyOptional({
           provider: body.provider,
           azureEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
+          anthropicWifEnabled: anthropicWorkloadIdentity.isEnabled(),
         });
       if (canSync) {
         try {
@@ -766,11 +867,32 @@ const llmProviderApiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
             testExtraHeaders,
           );
         } else if (
-          !isProviderApiKeyOptional({
+          apiKeyFromDB.provider === "anthropic" &&
+          anthropicWorkloadIdentity.isEnabled()
+        ) {
+          // Keyless Anthropic WIF key — re-test with the updated runtime settings.
+          await testApiKeyOrThrow(
+            apiKeyFromDB.provider,
+            "",
+            testBaseUrl,
+            testExtraHeaders,
+          );
+        } else if (
+          isProviderApiKeyOptional({
             provider: apiKeyFromDB.provider,
-            azureEntraIdEnabled: isAzureOpenAiEntraIdEnabled(),
+            // azure is handled above; only self-hosted Ollama/vLLM fall here.
+            azureEntraIdEnabled: false,
           })
         ) {
+          // Self-hosted provider with no stored key — re-test connectivity so a
+          // newly-set Base URL that can't be reached (e.g. Docker localhost)
+          // surfaces with a helpful hint.
+          await testKeylessConnectivityOrThrow(
+            apiKeyFromDB.provider,
+            testBaseUrl,
+            testExtraHeaders,
+          );
+        } else {
           throw new ApiError(
             400,
             "Cannot update Base URL, Inference URL, or extra headers without existing API key",
@@ -826,7 +948,17 @@ const llmProviderApiKeyRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       if (Object.keys(updateData).length > 0) {
-        await LlmProviderApiKeyModel.update(params.id, updateData);
+        try {
+          await LlmProviderApiKeyModel.update(params.id, updateData);
+        } catch (error) {
+          if (isUniqueConstraintError(error)) {
+            throw new ApiError(
+              409,
+              "Another primary key for this provider and scope was set concurrently. Please retry.",
+            );
+          }
+          throw error;
+        }
       }
 
       const updated = await LlmProviderApiKeyModel.findById(params.id);

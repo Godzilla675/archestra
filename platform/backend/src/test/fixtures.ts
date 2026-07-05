@@ -48,7 +48,6 @@ import type {
   InsertKnowledgeBase,
   InsertKnowledgeBaseConnector,
   InsertLlmProviderApiKey,
-  InsertMcpServer,
   InsertMember,
   InsertOrganization,
   InsertOrganizationRole,
@@ -70,7 +69,10 @@ import type {
 import type { ResourceVisibilityScope } from "@/types/visibility";
 
 type MakeUserOverrides = Partial<
-  Pick<InsertUser, "email" | "name" | "emailVerified" | "role">
+  Pick<
+    InsertUser,
+    "email" | "name" | "emailVerified" | "role" | "twoFactorEnabled"
+  >
 >;
 
 /**
@@ -183,7 +185,13 @@ async function makeVirtualApiKey(
  */
 async function makeOrganization(
   overrides: Partial<
-    Pick<InsertOrganization, "name" | "slug" | "globalToolPolicy">
+    Pick<
+      InsertOrganization,
+      | "name"
+      | "slug"
+      | "defaultDiscoveredToolInvocationPolicy"
+      | "defaultDiscoveredToolResultPolicy"
+    >
   > = {},
 ) {
   const orgId = crypto.randomUUID();
@@ -611,8 +619,21 @@ async function makeMember(
  * Creates a test MCP server in the database
  */
 async function makeMcpServer(
+  // Typed against the raw Drizzle insert shape, not the API-validated
+  // `InsertMcpServer` — this fixture writes directly via `db.insert`, and
+  // `oauthRefreshError` (server-owned state) is intentionally excluded from
+  // the API-facing insert schema.
   overrides: Partial<
-    Pick<InsertMcpServer, "name" | "catalogId" | "ownerId" | "teamId" | "scope">
+    Pick<
+      typeof schema.mcpServersTable.$inferInsert,
+      | "name"
+      | "catalogId"
+      | "ownerId"
+      | "teamId"
+      | "scope"
+      | "localInstallationStatus"
+      | "oauthRefreshError"
+    >
   > = {},
 ) {
   // Create a catalog if catalogId is not provided
@@ -650,6 +671,7 @@ async function makeInternalMcpCatalog(
       InsertInternalMcpCatalog,
       | "id"
       | "name"
+      | "icon"
       | "serverType"
       | "serverUrl"
       | "description"

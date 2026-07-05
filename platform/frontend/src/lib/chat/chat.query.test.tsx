@@ -1,16 +1,22 @@
 import { archestraApiSdk, type archestraApiTypes } from "@archestra/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, test, vi } from "vitest";
 import { handleApiError } from "@/lib/utils";
 import {
   invalidateConversationFileQueries,
   mergeUpdatedConversationIntoCache,
+  useClearChatErrors,
   useConversation,
   useConversationEnabledTools,
   useConversationFiles,
   useConversations,
+  useConversationUpdatedCacheSync,
+  useDeleteConversation,
+  useKeepViewedConversationRead,
+  useMarkConversationRead,
   useMemberDefaultModel,
 } from "./chat.query";
 
@@ -21,9 +27,25 @@ vi.mock("@archestra/shared", () => ({
     getChatConversationFiles: vi.fn(),
     getMemberDefaultModel: vi.fn(),
     getConversationEnabledTools: vi.fn(),
+    markChatConversationRead: vi.fn(),
+    deleteChatConversation: vi.fn(),
+    clearChatConversationErrors: vi.fn(),
   },
   PLAYWRIGHT_MCP_CATALOG_ID: "playwright-catalog-id",
   PLAYWRIGHT_MCP_SERVER_NAME: "playwright-mcp",
+}));
+
+vi.mock("next/navigation");
+
+const wsHandlers: Record<string, (msg: unknown) => void> = {};
+vi.mock("@/lib/websocket/websocket", () => ({
+  default: {
+    connect: vi.fn(),
+    subscribe: (type: string, handler: (msg: unknown) => void) => {
+      wsHandlers[type] = handler;
+      return () => delete wsHandlers[type];
+    },
+  },
 }));
 
 vi.mock("@/lib/utils", async () => {
@@ -365,3 +387,246 @@ function makeConversation(): archestraApiTypes.GetChatConversationResponses["200
     compactions: [],
   };
 }
+
+describe("conversation read-state hooks", () => {
+  const seededList = (...convs: Array<{ id: string; unread: boolean }>) =>
+    convs.map((c) => ({ ...makeConversation(), id: c.id, unread: c.unread }));
+
+  const renderWithSeed = <T,>(
+    hook: () => T,
+    seed: ReturnType<typeof seededList>,
+  ) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    // Seeded fresh (staleTime > 0), so useConversations serves it without an
+    // immediate refetch — the hooks read this directly.
+    queryClient.setQueryData(["conversations", undefined], seed);
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    return { queryClient, ...renderHook(hook, { wrapper }) };
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(usePathname).mockReturnValue("/chat");
+    for (const key of Object.keys(wsHandlers)) delete wsHandlers[key];
+    vi.mocked(archestraApiSdk.markChatConversationRead).mockResolvedValue({
+      data: { success: true },
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.markChatConversationRead>>);
+  });
+
+  it("useMarkConversationRead optimistically clears unread in cached lists", async () => {
+    const { queryClient, result } = renderWithSeed(
+      () => useMarkConversationRead(),
+      seededList({ id: "c1", unread: true }, { id: "c2", unread: true }),
+    );
+
+    act(() => {
+      result.current.mutate({ id: "c1" });
+    });
+
+    const list = queryClient.getQueryData<
+      Array<{ id: string; unread: boolean }>
+    >(["conversations", undefined]);
+    expect(list?.find((c) => c.id === "c1")?.unread).toBe(false);
+    expect(list?.find((c) => c.id === "c2")?.unread).toBe(true);
+    await waitFor(() =>
+      expect(archestraApiSdk.markChatConversationRead).toHaveBeenCalledWith({
+        path: { id: "c1" },
+      }),
+    );
+  });
+
+  it("useKeepViewedConversationRead marks the viewed unread conversation read", async () => {
+    vi.mocked(usePathname).mockReturnValue("/chat/c1");
+    renderWithSeed(
+      () => useKeepViewedConversationRead(),
+      seededList({ id: "c1", unread: true }),
+    );
+
+    await waitFor(() =>
+      expect(archestraApiSdk.markChatConversationRead).toHaveBeenCalledWith({
+        path: { id: "c1" },
+      }),
+    );
+  });
+
+  it("useKeepViewedConversationRead does not mark an already-read viewed conversation", async () => {
+    vi.mocked(usePathname).mockReturnValue("/chat/c1");
+    renderWithSeed(
+      () => useKeepViewedConversationRead(),
+      seededList({ id: "c1", unread: false }),
+    );
+
+    await Promise.resolve();
+    expect(archestraApiSdk.markChatConversationRead).not.toHaveBeenCalled();
+  });
+
+  it("useKeepViewedConversationRead does not mark read off a conversation route", async () => {
+    vi.mocked(usePathname).mockReturnValue("/chat");
+    renderWithSeed(
+      () => useKeepViewedConversationRead(),
+      seededList({ id: "c1", unread: true }),
+    );
+
+    await Promise.resolve();
+    expect(archestraApiSdk.markChatConversationRead).not.toHaveBeenCalled();
+  });
+
+  it("useConversationUpdatedCacheSync invalidates conversations on a push", () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    renderHook(() => useConversationUpdatedCacheSync(), { wrapper });
+
+    expect(wsHandlers.conversation_updated).toBeDefined();
+    act(() => {
+      wsHandlers.conversation_updated({
+        type: "conversation_updated",
+        payload: { conversationId: "c1" },
+      });
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+});
+
+describe("useDeleteConversation project-list invalidation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(archestraApiSdk.deleteChatConversation).mockResolvedValue({
+      data: { success: true },
+      error: undefined,
+    } as Awaited<ReturnType<typeof archestraApiSdk.deleteChatConversation>>);
+  });
+
+  const renderDelete = (conversation: {
+    id: string;
+    projectId: string | null;
+  }) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", undefined],
+      [{ ...makeConversation(), ...conversation }],
+    );
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    return {
+      invalidateSpy,
+      ...renderHook(() => useDeleteConversation(), { wrapper }),
+    };
+  };
+
+  it("invalidates the project's conversation list when a project chat is deleted", async () => {
+    const { invalidateSpy, result } = renderDelete({
+      id: "c1",
+      projectId: "p1",
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync("c1");
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["projects", "p1", "conversations"],
+    });
+  });
+
+  it("does not invalidate any project query for a non-project chat", async () => {
+    const { invalidateSpy, result } = renderDelete({
+      id: "c1",
+      projectId: null,
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync("c1");
+    });
+
+    const touchedProjects = invalidateSpy.mock.calls.some(
+      ([arg]) => Array.isArray(arg?.queryKey) && arg.queryKey[0] === "projects",
+    );
+    expect(touchedProjects).toBe(false);
+  });
+});
+
+describe("useClearChatErrors", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const renderClear = (chatErrors: unknown[]) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(["conversation", "c1"], { id: "c1", chatErrors });
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    return {
+      queryClient,
+      cancelSpy,
+      invalidateSpy,
+      ...renderHook(() => useClearChatErrors(), { wrapper }),
+    };
+  };
+
+  const cachedChatErrors = (queryClient: QueryClient) =>
+    queryClient.getQueryData<{ chatErrors: unknown[] }>(["conversation", "c1"])
+      ?.chatErrors;
+
+  it("optimistically drops the error rows and cancels in-flight refetches", async () => {
+    vi.mocked(archestraApiSdk.clearChatConversationErrors).mockResolvedValue({
+      data: { success: true },
+      error: undefined,
+    } as Awaited<
+      ReturnType<typeof archestraApiSdk.clearChatConversationErrors>
+    >);
+    const { queryClient, cancelSpy, invalidateSpy, result } = renderClear([
+      { id: "err-1", error: { message: "boom" } },
+    ]);
+
+    await act(async () => {
+      await result.current.mutateAsync({ id: "c1" });
+    });
+
+    // Cancels the competing conversation refetch so it can't resurrect the rows.
+    expect(cancelSpy).toHaveBeenCalledWith({
+      queryKey: ["conversation", "c1"],
+    });
+    // The card is gone immediately and stays gone after the delete settles.
+    expect(cachedChatErrors(queryClient)).toEqual([]);
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["conversation", "c1"],
+    });
+  });
+
+  it("restores the error rows when the delete fails", async () => {
+    const rows = [{ id: "err-1", error: { message: "boom" } }];
+    vi.mocked(archestraApiSdk.clearChatConversationErrors).mockResolvedValue(
+      errorResult(500) as Awaited<
+        ReturnType<typeof archestraApiSdk.clearChatConversationErrors>
+      >,
+    );
+    const { queryClient, result } = renderClear(rows);
+
+    await act(async () => {
+      await result.current.mutateAsync({ id: "c1" }).catch(() => {});
+    });
+
+    // The delete didn't take, so the user must still see the error.
+    expect(cachedChatErrors(queryClient)).toEqual(rows);
+  });
+});

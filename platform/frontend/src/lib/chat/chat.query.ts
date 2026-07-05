@@ -11,6 +11,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { invalidateToolAssignmentQueries } from "@/lib/agent-tools.hook";
@@ -23,6 +24,7 @@ import {
 } from "@/lib/chat/conversation-files";
 import { useMcpServers } from "@/lib/mcp/mcp-server.query";
 import { handleApiError } from "@/lib/utils";
+import websocketService from "@/lib/websocket/websocket";
 
 const {
   getChatConversations,
@@ -32,6 +34,7 @@ const {
   createChatConversation,
   updateChatConversation,
   setConversationHooksDebug,
+  markChatConversationRead,
   clearChatConversationErrors,
   compactChatConversation,
   deleteChatConversation,
@@ -255,8 +258,84 @@ export function useConversations({
     enabled,
     staleTime: search ? 0 : 2_000, // No stale time for searches, 2 seconds otherwise
     gcTime: 10 * 60 * 1000,
-    refetchOnWindowFocus: false,
+    // Backstop for the conversation_updated websocket push (see
+    // useConversationUpdatedCacheSync): if the socket was down when a message
+    // landed, refocusing or reconnecting still refreshes the unread indicators.
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
   });
+}
+
+/**
+ * Mark a conversation read (owner-only on the server), clearing its sidebar
+ * new-messages dot. Optimistically flips `unread` to false across cached
+ * conversation lists so the dot disappears the instant the chat is opened; the
+ * optimistic write also stops {@link useKeepViewedConversationRead} from
+ * re-firing while the request is in flight.
+ */
+export function useMarkConversationRead() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id }: { id: string }) =>
+      callApi(() => markChatConversationRead({ path: { id } }), null),
+    onMutate: ({ id }) => {
+      queryClient.setQueriesData<
+        archestraApiTypes.GetChatConversationsResponses["200"]
+      >({ queryKey: ["conversations"] }, (old) =>
+        old
+          ? old.map((c) =>
+              c.id === id && c.unread ? { ...c, unread: false } : c,
+            )
+          : old,
+      );
+    },
+  });
+}
+
+/**
+ * Keep the conversation shown in the URL marked read: whenever it appears
+ * unread in the list cache — on open, or when the conversation_updated push
+ * refreshes the list while you're viewing it — POST a read. Keyed on the live
+ * pathname, not page-held state, so a freshly-created chat whose id lags the
+ * URL never clears a chat you have already navigated away from.
+ */
+export function useKeepViewedConversationRead() {
+  const pathname = usePathname();
+  const { mutate: markRead } = useMarkConversationRead();
+  const { data: conversations } = useConversations({});
+
+  const viewedConversationId = pathname.startsWith("/chat/")
+    ? (pathname.split("/").at(-1) ?? undefined)
+    : undefined;
+  const isViewedUnread = viewedConversationId
+    ? !!conversations?.find((c) => c.id === viewedConversationId)?.unread
+    : false;
+
+  useEffect(() => {
+    if (viewedConversationId && isViewedUnread) {
+      markRead({ id: viewedConversationId });
+    }
+  }, [viewedConversationId, isViewedUnread, markRead]);
+}
+
+/**
+ * Refresh the sidebar's unread indicators when the server pushes a
+ * conversation_updated message (a turn finished in one of the owner's chats).
+ * This is what surfaces the dot on a backgrounded chat whose stream completion
+ * the client never witnessed. Mount once, app-wide.
+ */
+export function useConversationUpdatedCacheSync(enabled = true) {
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!enabled) return;
+
+    websocketService.connect();
+    return websocketService.subscribe("conversation_updated", () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    });
+  }, [enabled, queryClient]);
 }
 
 export function useCreateConversation() {
@@ -418,17 +497,56 @@ export function useCompactConversation() {
 }
 
 /**
- * Clear a conversation's recorded chat errors. Used by the scheduled-run
- * "Try again" affordance: after wiping the error rows we invalidate the
- * conversation so the inline error card disappears before the prompt is resent.
+ * Clear a conversation's recorded chat errors. Used by the chat session's
+ * regenerate flow ("Try again" on the error card, the regenerate action on a
+ * user message, edited resends) and the silent auto-retry success path.
+ *
+ * Optimistically drops the persisted error rows from the conversation cache and
+ * cancels any in-flight conversation refetch *before* the delete. The regenerate
+ * flow persists the (edited) user message just before calling this, which kicks
+ * off a conversation refetch that reads the error rows while they still exist —
+ * without the cancel + optimistic write, that refetch lands last and resurrects
+ * the stale error card above the freshly regenerated answer. Mirrors the
+ * optimistic-removal pattern in useDeleteConversation.
  */
 export function useClearChatErrors() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ id }: { id: string }) =>
-      callApi(() => clearChatConversationErrors({ path: { id } }), null),
-    onSuccess: (_data, variables) => {
+    mutationFn: async ({ id }: { id: string }) => {
+      const { data, error } = await clearChatConversationErrors({
+        path: { id },
+      });
+      if (error) {
+        handleApiError(error);
+        // Throw to trigger onError rollback for the optimistic cache removal.
+        throw error;
+      }
+      return data;
+    },
+    onMutate: async ({ id }) => {
+      const queryKey = ["conversation", id];
+      // Cancel in-flight refetches so they can't overwrite the optimistic clear.
+      await queryClient.cancelQueries({ queryKey });
+      const previous =
+        queryClient.getQueryData<
+          archestraApiTypes.GetChatConversationResponses["200"]
+        >(queryKey);
+      // Drop the error rows immediately so the inline card disappears at once.
+      queryClient.setQueryData<
+        archestraApiTypes.GetChatConversationResponses["200"]
+      >(queryKey, (old) => (old ? { ...old, chatErrors: [] } : old));
+      return { previous, queryKey };
+    },
+    onError: (_error, _variables, context) => {
+      // The delete failed — restore the rows so the user still sees the error.
+      if (context?.previous !== undefined) {
+        queryClient.setQueryData(context.queryKey, context.previous);
+      }
+    },
+    onSettled: (_data, _error, variables) => {
+      // Reconcile with the server: confirms the rows are gone on success, or
+      // brings them back if the delete never took.
       queryClient.invalidateQueries({
         queryKey: ["conversation", variables.id],
       });
@@ -491,6 +609,12 @@ export function useDeleteConversation() {
         queryKey: ["conversations"],
       });
 
+      // Capture the deleted conversation's project (if any) so onSettled can
+      // also refresh the project page's own conversation list.
+      const projectId = previousQueries
+        .flatMap(([, data]) => data ?? [])
+        .find((c) => c.id === deletedId)?.projectId;
+
       // Optimistically remove the conversation from every cached list
       queryClient.setQueriesData<
         archestraApiTypes.GetChatConversationsResponses["200"]
@@ -498,7 +622,7 @@ export function useDeleteConversation() {
         old ? old.filter((c) => c.id !== deletedId) : old,
       );
 
-      return { previousQueries };
+      return { previousQueries, projectId };
     },
     onError: (_error, _deletedId, context) => {
       // Roll back optimistic removal on failure
@@ -521,9 +645,16 @@ export function useDeleteConversation() {
 
       toast.success("Conversation deleted");
     },
-    onSettled: () => {
+    onSettled: (_data, _error, _deletedId, context) => {
       // Always refetch to ensure server state is in sync
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // A project chat is also listed on its project page under a separate
+      // query key, which the sidebar invalidation above does not cover.
+      if (context?.projectId) {
+        queryClient.invalidateQueries({
+          queryKey: ["projects", context.projectId, "conversations"],
+        });
+      }
     },
   });
 }

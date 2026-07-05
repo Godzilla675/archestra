@@ -5,6 +5,7 @@ import {
   extractGroupsFromClaims,
   retrieveIdpGroups,
 } from "@/auth/idp-team-sync-cache.ee";
+import { CREDENTIAL_PROVIDER_ID } from "@/constants";
 import { enterpriseTier } from "@/enterprise-tier";
 import { handleTeamOrGroupMappingChange } from "@/knowledge-base/recomputation";
 import logger from "@/logging";
@@ -495,7 +496,7 @@ async function getRecentSsoAccount(params: {
   const allAccounts = await AccountModel.getAllByUserId(params.userId);
 
   const matchingAccounts = allAccounts.filter((account) => {
-    if (account.providerId === "credential") {
+    if (account.providerId === CREDENTIAL_PROVIDER_ID) {
       return false;
     }
 

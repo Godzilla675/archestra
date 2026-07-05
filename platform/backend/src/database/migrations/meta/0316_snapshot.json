@@ -1,5 +1,5 @@
 {
-  "id": "e80381d7-16c8-45dd-a733-411d9229360e",
+  "id": "a3a39334-98f3-49c8-92d5-b4541ac07f90",
   "prevId": "761f7107-ccd4-4ec3-a4b2-f8e4448a88a7",
   "version": "7",
   "dialect": "postgresql",
@@ -7066,18 +7066,6 @@
           "notNull": true,
           "default": 0
         },
-        "permission_sync_status": {
-          "name": "permission_sync_status",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "permission_sync_metadata": {
-          "name": "permission_sync_metadata",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp",
@@ -10355,6 +10343,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'permissive'"
+        },
+        "discovered_tool_policy": {
+          "name": "discovered_tool_policy",
+          "type": "varchar",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'relaxed'"
         },
         "allow_chat_file_uploads": {
           "name": "allow_chat_file_uploads",

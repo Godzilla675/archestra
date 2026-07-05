@@ -5,6 +5,7 @@ import {
   DEFAULT_PROVIDER_BASE_URLS,
   E2eTestId,
   isProviderApiKeyOptional,
+  isSelfHostedProvider,
   providerRequiresPerUserCredential,
 } from "@archestra/shared";
 import { Building2, CheckCircle2, Trash2, User, Users } from "lucide-react";
@@ -25,6 +26,7 @@ import { LlmProviderSelectItems } from "./llm-provider-select-items";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
+import { SecretInput } from "./ui/secret-input";
 import {
   Select,
   SelectContent,
@@ -318,6 +320,7 @@ export function LlmProviderApiKeyForm({
   const authDocsUrl = getFrontendDocsUrl("platform-llm-proxy-authentication");
   const byosEnabled = useFeature("byosEnabled");
   const azureOpenAiEntraIdEnabled = useFeature("azureOpenAiEntraIdEnabled");
+  const anthropicWifEnabled = useFeature("anthropicWifEnabled");
   const { data: providerBaseUrls } = useProviderBaseUrls();
   const { data: canReadTeams } = useHasPermissions({ team: ["read"] });
   const { data: isLlmProviderApiKeyAdmin } = useHasPermissions({
@@ -507,17 +510,27 @@ export function LlmProviderApiKeyForm({
         teamId={teamId}
         selectedSecretPath={form.getValues("vaultSecretPath")}
         selectedSecretKey={form.getValues("vaultSecretKey")}
-        onSecretPathChange={(value) => form.setValue("vaultSecretPath", value)}
-        onSecretKeyChange={(value) => form.setValue("vaultSecretKey", value)}
+        onSecretPathChange={(value) =>
+          form.setValue("vaultSecretPath", value, { shouldDirty: true })
+        }
+        onSecretKeyChange={(value) =>
+          form.setValue("vaultSecretKey", value, { shouldDirty: true })
+        }
       />
     ) : (
       <ExternalSecretSelector
         selectedTeamId={teamId}
         selectedSecretPath={form.getValues("vaultSecretPath")}
         selectedSecretKey={form.getValues("vaultSecretKey")}
-        onTeamChange={(value) => form.setValue("teamId", value)}
-        onSecretChange={(value) => form.setValue("vaultSecretPath", value)}
-        onSecretKeyChange={(value) => form.setValue("vaultSecretKey", value)}
+        onTeamChange={(value) =>
+          form.setValue("teamId", value, { shouldDirty: true })
+        }
+        onSecretChange={(value) =>
+          form.setValue("vaultSecretPath", value, { shouldDirty: true })
+        }
+        onSecretKeyChange={(value) =>
+          form.setValue("vaultSecretKey", value, { shouldDirty: true })
+        }
       />
     );
 
@@ -618,6 +631,7 @@ export function LlmProviderApiKeyForm({
                   form.setValue(
                     "bedrockAuthMethod",
                     value as "api-key" | "sigv4" | "iam",
+                    { shouldDirty: true },
                   )
                 }
               >
@@ -727,6 +741,7 @@ export function LlmProviderApiKeyForm({
                     {isProviderApiKeyOptional({
                       provider,
                       azureEntraIdEnabled: azureOpenAiEntraIdEnabled === true,
+                      anthropicWifEnabled: anthropicWifEnabled === true,
                     }) ? (
                       <span className="font-normal text-muted-foreground">
                         (optional)
@@ -745,14 +760,16 @@ export function LlmProviderApiKeyForm({
                     </p>
                   )}
                   <div className="relative">
-                    <Input
+                    <SecretInput
                       id="llm-provider-api-key-value"
-                      type="password"
                       placeholder={providerConfig.placeholder}
                       disabled={isPending}
-                      autoComplete="new-password"
-                      data-1p-ignore
-                      data-lpignore="true"
+                      // Offer the reveal toggle when adding a key so the user
+                      // can verify what they typed or pasted. Editing keeps the
+                      // "configured" check in that same corner instead, and
+                      // gating on the (constant) edit mode avoids remounting the
+                      // input mid-edit when the check would otherwise toggle.
+                      revealable={!isEditMode}
                       className={
                         showConfiguredStyling ? "border-green-500 pr-10" : ""
                       }
@@ -784,11 +801,9 @@ export function LlmProviderApiKeyForm({
                   <Label htmlFor="llm-provider-aws-access-key-id">
                     Access Key ID
                   </Label>
-                  <Input
+                  <SecretInput
                     id="llm-provider-aws-access-key-id"
-                    type="password"
                     placeholder="AKIA..."
-                    autoComplete="off"
                     disabled={isPending}
                     {...form.register("awsAccessKeyId")}
                   />
@@ -797,11 +812,9 @@ export function LlmProviderApiKeyForm({
                   <Label htmlFor="llm-provider-aws-secret-access-key">
                     Secret Access Key
                   </Label>
-                  <Input
+                  <SecretInput
                     id="llm-provider-aws-secret-access-key"
-                    type="password"
                     placeholder="••••••••"
-                    autoComplete="off"
                     disabled={isPending}
                     {...form.register("awsSecretAccessKey")}
                   />
@@ -813,11 +826,9 @@ export function LlmProviderApiKeyForm({
                       (optional)
                     </span>
                   </Label>
-                  <Input
+                  <SecretInput
                     id="llm-provider-aws-session-token"
-                    type="password"
                     placeholder="Required for temporary credentials (STS / AssumeRole)"
-                    autoComplete="off"
                     disabled={isPending}
                     {...form.register("awsSessionToken")}
                   />
@@ -848,9 +859,9 @@ export function LlmProviderApiKeyForm({
               value={scope}
               options={visibilityOptions}
               onValueChange={(nextScope) => {
-                form.setValue("scope", nextScope);
+                form.setValue("scope", nextScope, { shouldDirty: true });
                 if (nextScope !== "team") {
-                  form.setValue("teamId", null);
+                  form.setValue("teamId", null, { shouldDirty: true });
                 }
               }}
             >
@@ -875,7 +886,9 @@ export function LlmProviderApiKeyForm({
                   <Label htmlFor="llm-provider-api-key-team">Team</Label>
                   <Select
                     value={teamId ?? undefined}
-                    onValueChange={(value) => form.setValue("teamId", value)}
+                    onValueChange={(value) =>
+                      form.setValue("teamId", value, { shouldDirty: true })
+                    }
                     disabled={isPending || !canReadTeams || teams.length === 0}
                   >
                     <SelectTrigger
@@ -911,7 +924,7 @@ export function LlmProviderApiKeyForm({
                 id="llm-provider-api-key-is-primary"
                 checked={form.watch("isPrimary")}
                 onCheckedChange={(checked) =>
-                  form.setValue("isPrimary", checked)
+                  form.setValue("isPrimary", checked, { shouldDirty: true })
                 }
                 disabled={isPending || Boolean(existingPrimaryKey)}
               />
@@ -932,6 +945,14 @@ export function LlmProviderApiKeyForm({
             Override the default API endpoint. Useful for self-hosted or proxy
             setups.
           </p>
+          {isSelfHostedProvider(provider) && (
+            <p className="text-xs text-muted-foreground">
+              If this app runs in Docker, <code>localhost</code> points at the
+              container, not your host machine. Use{" "}
+              <code>host.docker.internal</code> instead (e.g.{" "}
+              <code>http://host.docker.internal:11434/v1</code>).
+            </p>
+          )}
           <Input
             id="llm-provider-api-key-base-url"
             type="url"

@@ -118,7 +118,14 @@ export const E2eTestId = {
   // Chat Model Selector
   ChatModelSelectorTrigger: "chat-model-selector-trigger",
   ChatPromptTextarea: "chat-prompt-textarea",
+  // Chat sidebar item status indicators
+  ChatItemGeneratingIndicator: "chat-item-generating-indicator",
+  ChatItemUnreadIndicator: "chat-item-unread-indicator",
   QuickstartAddApiKeyButton: "quickstart-add-api-key-button",
+  // First-run "set a default model" onboarding nudge (after the first key)
+  OnboardingDefaultModelOpen: "onboarding-default-model-open",
+  OnboardingDefaultModelSkip: "onboarding-default-model-skip",
+  OnboardingDefaultModelSubmit: "onboarding-default-model-submit",
   ApiKeysLoadErrorRetry: "api-keys-load-error-retry",
   // MCP Logs
   McpLogsDialog: "mcp-logs-dialog",
@@ -127,6 +134,9 @@ export const E2eTestId = {
   McpLogsViewButton: "mcp-logs-view-button",
   McpLogsEditConfigButton: "mcp-logs-edit-config-button",
   McpLogsTab: "mcp-logs-tab",
+  // Connectivity / offline status bar
+  ConnectivityStatusBar: "connectivity-status-bar",
+  ConnectivityStatusBarRetry: "connectivity-status-bar-retry",
   // Role debugger / impersonation
   ImpersonationBanner: "impersonation-banner",
   ImpersonationStopButton: "impersonation-stop-button",
@@ -149,6 +159,18 @@ export function getChatApiKeySelectorProviderGroupTestId(
   provider: string,
 ): string {
   return `chat-api-key-selector-provider-${provider}`;
+}
+
+export function getChatItemGeneratingIndicatorTestId(
+  conversationId: string,
+): string {
+  return `${E2eTestId.ChatItemGeneratingIndicator}-${conversationId}`;
+}
+
+export function getChatItemUnreadIndicatorTestId(
+  conversationId: string,
+): string {
+  return `${E2eTestId.ChatItemUnreadIndicator}-${conversationId}`;
 }
 
 export function getChatApiKeySelectorOptionTestId(keyId: string): string {

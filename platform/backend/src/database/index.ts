@@ -37,42 +37,16 @@ export async function initializeDatabase(): Promise<void> {
     return; // Already initialized
   }
 
-  let connectionString: string;
-
-  const vaultRef = process.env[DATABASE_URL_VAULT_REF_ENV];
-  if (vaultRef && isReadonlyVaultEnabled()) {
-    // READONLY_VAULT is enabled and vault ref is set - read from Vault
-    const vaultUrl = await getDatabaseUrlFromVault(vaultRef);
-    if (vaultUrl) {
-      logger.info(
-        { connectionStringPrefix: vaultUrl.slice(0, 10) },
-        "Database URL successfully loaded from Vault",
-      );
-      connectionString = vaultUrl;
-    } else {
-      logger.info("Database URL not found in Vault, falling back to env var");
-      connectionString = config.database.url;
-    }
-  } else {
-    // Use env var
-    logger.info(
-      "ARCHESTRA_DATABASE_URL_VAULT_REF is not set or READONLY_VAULT is not enabled, falling back to env var",
-    );
-    connectionString = config.database.url;
+  // Share one in-flight init between concurrent callers so only a single
+  // pool is ever created. On failure the stored promise is cleared, so a
+  // later call retries instead of rejecting forever.
+  if (!initPromise) {
+    initPromise = doInitializeDatabase().catch((error) => {
+      initPromise = null;
+      throw error;
+    });
   }
-
-  pool = createPool(connectionString);
-  db = drizzle({
-    client: pool,
-    schema,
-  });
-
-  instrumentDrizzleClient(db, { dbSystem: "postgresql" });
-  installDbErrorSafetyNet();
-  logger.info(
-    { poolMax: config.database.poolMax },
-    "Database connection pool initialized",
-  );
+  return initPromise;
 }
 
 /**
@@ -156,10 +130,15 @@ export { schema };
 /**
  * Set the database instance directly (for testing purposes only).
  * This bypasses the normal initialization flow.
+ *
+ * Pass `null` on test-file teardown: between files in a shared worker,
+ * accesses through the proxy then fail with getDb()'s "Database not
+ * initialized" — a condition import-time consumers already tolerate —
+ * instead of "PGlite is closed" from a torn-down instance.
  * @public — consumed via dynamic import in src/test/setup.ts
  */
 export function __setTestDb(
-  testDb: ReturnType<typeof drizzle<typeof schema>>,
+  testDb: ReturnType<typeof drizzle<typeof schema>> | null,
 ): void {
   db = testDb;
 }
@@ -170,6 +149,57 @@ export function __setTestDb(
 
 let pool: pg.Pool | null = null;
 let db: ReturnType<typeof drizzle<typeof schema>> | null = null;
+let initPromise: Promise<void> | null = null;
+
+async function doInitializeDatabase(): Promise<void> {
+  let connectionString: string;
+
+  const vaultRef = process.env[DATABASE_URL_VAULT_REF_ENV];
+  if (vaultRef && isReadonlyVaultEnabled()) {
+    // READONLY_VAULT is enabled and vault ref is set - read from Vault
+    const vaultUrl = await getDatabaseUrlFromVault(vaultRef);
+    if (vaultUrl) {
+      logger.info(
+        { connectionStringPrefix: vaultUrl.slice(0, 10) },
+        "Database URL successfully loaded from Vault",
+      );
+      connectionString = vaultUrl;
+    } else {
+      logger.info("Database URL not found in Vault, falling back to env var");
+      connectionString = config.database.url;
+    }
+  } else {
+    // Use env var
+    logger.info(
+      "ARCHESTRA_DATABASE_URL_VAULT_REF is not set or READONLY_VAULT is not enabled, falling back to env var",
+    );
+    connectionString = config.database.url;
+  }
+
+  // Assign the globals only once everything has succeeded: a throw from the
+  // instrumentation below must not leave a half-initialized db that makes
+  // the next initializeDatabase() call return early instead of retrying.
+  const newPool = createPool(connectionString);
+  try {
+    const newDb = drizzle({
+      client: newPool,
+      schema,
+    });
+
+    instrumentDrizzleClient(newDb, { dbSystem: "postgresql" });
+    installDbErrorSafetyNet();
+
+    pool = newPool;
+    db = newDb;
+  } catch (error) {
+    await newPool.end().catch(() => {});
+    throw error;
+  }
+  logger.info(
+    { poolMax: config.database.poolMax },
+    "Database connection pool initialized",
+  );
+}
 
 /**
  * Create a connection pool with proper keepalive settings to prevent
@@ -184,6 +214,8 @@ let db: ReturnType<typeof drizzle<typeof schema>> | null = null;
  *   Postgres `max_connections` so that pods × poolMax stays under the server limit.
  * - idleTimeoutMillis: 30s (close idle connections after 30s)
  * - connectionTimeoutMillis: 10s (fail if can't get connection in 10s)
+ * - statement_timeout: ARCHESTRA_DATABASE_STATEMENT_TIMEOUT_MILLIS (default 30s);
+ *   kills runaway queries so a single slow query can't hang a connection forever.
  *
  * Connection keepalive configuration:
  * - keepAlive: true (enable TCP keepalive probes)
@@ -200,6 +232,9 @@ function createPool(connectionString: string): pg.Pool {
     max: config.database.poolMax,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 10000,
+    // Per-connection statement timeout: kills runaway queries instead of
+    // letting them hang a connection indefinitely. 0 disables it.
+    statement_timeout: config.database.statementTimeoutMillis,
     // Keepalive configuration to prevent "Connection terminated unexpectedly"
     keepAlive: true,
     keepAliveInitialDelayMillis: 10000,

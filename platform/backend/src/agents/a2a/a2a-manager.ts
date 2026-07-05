@@ -98,12 +98,12 @@ export class A2AManager {
     try {
       const { actor, agentId, request, systemParams } = params;
 
-      const a2aUser =
+      const [a2aUser, agent] = await Promise.all([
         actor.kind === "user" && actor.id !== "system"
-          ? await UserModel.getById(actor.id)
-          : null;
-
-      const agent = await AgentModel.findById(agentId);
+          ? UserModel.getById(actor.id)
+          : null,
+        AgentModel.findById(agentId),
+      ]);
       if (!agent) {
         throw new A2AError(A2AErrorKind.AgentNotFound);
       }
@@ -240,18 +240,22 @@ export class A2AManager {
       }
 
       const sessionId = systemParams?.sessionId ?? context?.id;
+      const [teams, userTeams] = await Promise.all([
+        AgentTeamModel.getTeamLabelInfoForAgent(agentId),
+        a2aUser
+          ? TeamModel.getTeamLabelInfoForUser({
+              userId: a2aUser.id,
+              organizationId: agent.organizationId,
+            })
+          : [],
+      ]);
       const result = await startActiveChatSpan({
         agentName: agent.name,
         agentId,
         agentType: agent.agentType ?? undefined,
         sessionId,
-        teams: await AgentTeamModel.getTeamLabelInfoForAgent(agentId),
-        userTeams: a2aUser
-          ? await TeamModel.getTeamLabelInfoForUser({
-              userId: a2aUser.id,
-              organizationId: agent.organizationId,
-            })
-          : [],
+        teams,
+        userTeams,
         routeCategory: systemParams?.routeCategory ?? RouteCategory.A2A,
         user: a2aUser
           ? { id: a2aUser.id, email: a2aUser.email, name: a2aUser.name }
@@ -662,6 +666,7 @@ function extractApprovalRequestsFromUiMessage(
     state: string;
     type: string;
     toolCallId: string;
+    input?: unknown;
   }[];
   for (const part of parts) {
     if (
@@ -673,6 +678,15 @@ function extractApprovalRequestsFromUiMessage(
         approvalId: part.approval.id,
         toolCallId: part.toolCallId,
         toolName: part.type.substring("tool-".length),
+        // The tool call's arguments, carried so approval prompts can describe
+        // what the tool will do (and unwrap a `run_tool` dispatch to its real
+        // target). Only an object input is meaningful here.
+        toolInput:
+          typeof part.input === "object" &&
+          part.input !== null &&
+          !Array.isArray(part.input)
+            ? (part.input as Record<string, unknown>)
+            : undefined,
         approved: Boolean(part.approval?.approved),
         resolved: part.state === "approval-responded",
       });

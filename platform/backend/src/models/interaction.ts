@@ -1,7 +1,13 @@
 import type {
+  ClientFilter,
   InteractionSource,
   PaginationQuery,
-  SessionClientSource,
+} from "@archestra/shared";
+import {
+  CLAUDE_CLIENT_AGENT_IDS,
+  CLAUDE_CLIENT_FILTER,
+  isClaudeSessionSource,
+  LEGACY_CLAUDE_CODE_SESSION_SOURCE,
 } from "@archestra/shared";
 import {
   and,
@@ -15,7 +21,6 @@ import {
   lte,
   max,
   min,
-  or,
   type SQL,
   sql,
   sum,
@@ -35,9 +40,12 @@ import type {
   SortingQuery,
   UserInfo,
 } from "@/types";
-import { InteractionAuthMethodSchema } from "@/types";
-import { escapeLikePattern } from "@/utils/sql-search";
-import { isUuid } from "@/utils/uuid";
+import {
+  InteractionAuthMethodSchema,
+  normalizeInteractionResponse,
+} from "@/types";
+import { trackBackgroundWork } from "@/utils/background-work";
+import { isUuid, uuidv7 } from "@/utils/uuid";
 import AgentModel from "./agent";
 import AgentTeamModel from "./agent-team";
 import ConversationChatErrorModel from "./conversation-chat-error";
@@ -90,8 +98,9 @@ function computeRequestType(
   request: unknown,
   sessionSource: string | null,
 ): "main" | "subagent" {
-  // Only apply detection heuristics for Claude sessions
-  if (sessionSource !== "claude_code" && sessionSource !== "claude_desktop") {
+  // Only apply detection heuristics for Claude sessions (claude_metadata, plus
+  // the legacy claude_code / claude_desktop values on older rows).
+  if (!isClaudeSessionSource(sessionSource)) {
     return "main";
   }
 
@@ -131,7 +140,11 @@ function computeRequestType(
     return "subagent";
   }
 
-  if (sessionSource === "claude_code") {
+  // Legacy rows only: newer Claude requests record session_source as
+  // claude_metadata, which can no longer be distinguished from Claude Desktop,
+  // so the Task-tool negative signal (unsafe for Desktop main agents) is not
+  // applied to them — they fall through to the default below.
+  if (sessionSource === LEGACY_CLAUDE_CODE_SESSION_SOURCE) {
     const tools = req?.tools ?? [];
     const hasTaskTool = tools.some((tool) => tool.name === "Task");
     return hasTaskTool ? "main" : "subagent";
@@ -272,6 +285,25 @@ function stripNullBytes<T>(value: T): T {
   return value;
 }
 
+/**
+ * Join predicate linking an interaction's `session_id` (VARCHAR) to a
+ * conversation's `id` (UUID) — used for Archestra Chat sessions whose
+ * session_id IS the conversation id.
+ *
+ * The only reason a cast is needed at all is type compatibility: Postgres has no
+ * `varchar = uuid` operator. We cast the TRUSTED side (`conversations.id::text`,
+ * which can never fail) rather than the untrusted `session_id::uuid` — a non-uuid
+ * session_id (e.g. some a2a / external-agent ids) would otherwise throw
+ * "invalid input syntax for type uuid" and 500 the whole query (see utils/uuid.ts).
+ * Comparing as text, a non-conversation session_id simply matches no row, and the
+ * equality on the bare `session_id` column can use interactions_session_*_idx.
+ * Conversation ids are generated as canonical lowercase uuids, so they match the
+ * canonical lowercase form `id::text` produces.
+ */
+function sessionIdMatchesConversation(): SQL {
+  return sql`${schema.interactionsTable.sessionId} = ${schema.conversationsTable.id}::text`;
+}
+
 class InteractionModel {
   static async existsByExecutionId(executionId: string): Promise<boolean> {
     const [result] = await db
@@ -308,7 +340,9 @@ class InteractionModel {
 
     const [interaction] = await db
       .insert(schema.interactionsTable)
-      .values(values)
+      // Monotonic v7 id: created_at ties happen under load, and the delta
+      // manager's "most recent interaction" lookup breaks ties with the id.
+      .values({ id: uuidv7(), ...values })
       .returning();
 
     if (tip) {
@@ -317,14 +351,16 @@ class InteractionModel {
 
     // Update usage tracking after interaction is created
     // Run in background to not block the response
-    InteractionModel.updateUsageAfterInteraction(
-      interaction as InsertInteraction & { id: string },
-    ).catch((error) => {
-      logger.error(
-        { error },
-        `Failed to update usage tracking for interaction ${interaction.id}`,
-      );
-    });
+    trackBackgroundWork(
+      InteractionModel.updateUsageAfterInteraction(
+        interaction as InsertInteraction & { id: string },
+      ).catch((error) => {
+        logger.error(
+          { error },
+          `Failed to update usage tracking for interaction ${interaction.id}`,
+        );
+      }),
+    );
 
     return interaction;
   }
@@ -452,6 +488,12 @@ class InteractionModel {
         request: full?.request ?? interaction.request,
         processedRequest:
           full?.processedRequest ?? interaction.processedRequest,
+        // Coerce a stored response that no longer matches its provider schema
+        // into a serializable sentinel so one bad row can't 500 the whole list.
+        response: normalizeInteractionResponse(
+          interaction.type,
+          interaction.response,
+        ),
         // computeRequestType must run on the reconstructed (full) request — it
         // inspects messages.length and the first/last message content.
         requestType: computeRequestType(
@@ -560,6 +602,12 @@ class InteractionModel {
       ...interaction,
       request: reconstructed.request,
       processedRequest: reconstructed.processedRequest,
+      // Coerce a stored response that no longer matches its provider schema
+      // into a serializable sentinel so a bad row can't 500 the detail route.
+      response: normalizeInteractionResponse(
+        interaction.type,
+        interaction.response,
+      ),
       chatErrors: await findChatErrorsForSessionId(interaction.sessionId),
     } as Interaction;
   }
@@ -577,7 +625,10 @@ class InteractionModel {
           ...(whereClauses ?? []),
         ),
       )
-      .orderBy(asc(schema.interactionsTable.createdAt));
+      .orderBy(
+        asc(schema.interactionsTable.createdAt),
+        asc(schema.interactionsTable.id),
+      );
 
     return withReconstructedRequests(rows);
   }
@@ -921,12 +972,11 @@ class InteractionModel {
       profileId?: string;
       userId?: string;
       source?: InteractionSource;
-      sessionSource?: SessionClientSource;
+      client?: ClientFilter;
       externalAgentId?: string;
       sessionId?: string;
       startDate?: Date;
       endDate?: Date;
-      search?: string;
     },
   ): Promise<PaginatedResult<SessionSummary>> {
     // Build where clauses for access control
@@ -964,10 +1014,17 @@ class InteractionModel {
       conditions.push(eq(schema.interactionsTable.source, filters.source));
     }
 
-    // Client/session source filter (e.g. claude_code, claude_desktop)
-    if (filters?.sessionSource) {
+    // Client-app filter — queries external_agent_id (the client-attribution
+    // column). CLAUDE_CLIENT_FILTER expands to every Claude client id, matched
+    // case-insensitively (header values, auto-discovered, and backfilled).
+    if (filters?.client === CLAUDE_CLIENT_FILTER) {
+      // Lower both sides so the match stays case-insensitive even if a
+      // mixed-case id is ever added to CLAUDE_CLIENT_AGENT_IDS.
       conditions.push(
-        eq(schema.interactionsTable.sessionSource, filters.sessionSource),
+        inArray(
+          sql`lower(${schema.interactionsTable.externalAgentId})`,
+          CLAUDE_CLIENT_AGENT_IDS.map((id) => id.toLowerCase()),
+        ),
       );
     }
 
@@ -993,25 +1050,6 @@ class InteractionModel {
     }
     if (filters?.endDate) {
       conditions.push(lte(schema.interactionsTable.createdAt, filters.endDate));
-    }
-
-    // Free-text search filter (case-insensitive)
-    // Searches across: request messages content, response content (for titles), and conversation titles
-    //
-    // IMPORTANT: Claude interaction are delta encoded, i.t. each row only stores a part of the context.
-    if (filters?.search) {
-      const searchPattern = `%${escapeLikePattern(filters.search)}%`;
-      const searchCondition = or(
-        // Search in request messages content (JSONB)
-        sql`${schema.interactionsTable.request}::text ILIKE ${searchPattern}`,
-        // Search in response content (for Claude Code titles)
-        sql`${schema.interactionsTable.response}::text ILIKE ${searchPattern}`,
-        // Search in conversation title (for Archestra Chat sessions)
-        sql`${schema.conversationsTable.title} ILIKE ${searchPattern}`,
-      );
-      if (searchCondition) {
-        conditions.push(searchCondition);
-      }
     }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
@@ -1075,13 +1113,7 @@ class InteractionModel {
           schema.usersTable,
           eq(schema.interactionsTable.userId, schema.usersTable.id),
         )
-        .leftJoin(
-          schema.conversationsTable,
-          // Only join when session_id is a valid UUID format (conversation IDs are UUIDs)
-          // Non-UUID session IDs (like "a2a-...") won't match any conversation
-          // Use CASE to safely handle the cast - only cast when length is 36 (UUID format)
-          sql`CASE WHEN LENGTH(${schema.interactionsTable.sessionId}) = 36 THEN ${schema.interactionsTable.sessionId}::uuid END = ${schema.conversationsTable.id}`,
-        )
+        .leftJoin(schema.conversationsTable, sessionIdMatchesConversation())
         .where(whereClause)
         .groupBy(
           sessionGroupExpr,
@@ -1091,14 +1123,18 @@ class InteractionModel {
         .orderBy(desc(max(schema.interactionsTable.createdAt)))
         .limit(pagination.limit)
         .offset(pagination.offset),
+      // Total = distinct sessions + sessionless interactions (each its own
+      // "session"). Counted without COUNT(DISTINCT COALESCE(session_id,
+      // id::text)) — the per-row uuid cast defeats the session_id index — and
+      // without the conversations join the main query needs for titles: the
+      // filters only touch interactions columns, and joining on the
+      // conversations PK can't change the count, so on large tables it only
+      // pushed this query into statement timeout.
       db
-        .select({ total: sql<number>`COUNT(DISTINCT ${sessionGroupExpr})` })
+        .select({
+          total: sql<number>`COUNT(DISTINCT ${schema.interactionsTable.sessionId}) + COUNT(*) FILTER (WHERE ${schema.interactionsTable.sessionId} IS NULL)`,
+        })
         .from(schema.interactionsTable)
-        .leftJoin(
-          schema.conversationsTable,
-          // Only join when session_id is a valid UUID format (conversation IDs are UUIDs)
-          sql`CASE WHEN LENGTH(${schema.interactionsTable.sessionId}) = 36 THEN ${schema.interactionsTable.sessionId}::uuid END = ${schema.conversationsTable.id}`,
-        )
         .where(whereClause),
     ]);
 

@@ -1,4 +1,5 @@
 import { ChatErrorCode } from "@archestra/shared";
+import db, { schema } from "@/database";
 import ConversationModel from "@/models/conversation";
 import ConversationAttachmentModel from "@/models/conversation-attachment";
 import ConversationChatErrorModel from "@/models/conversation-chat-error";
@@ -9,6 +10,7 @@ import { createFastifyInstance } from "@/server";
 import { projectService } from "@/services/project";
 import { afterEach, beforeEach, describe, expect, test } from "@/test";
 import type { User } from "@/types";
+import { uuidv7 } from "@/utils/uuid";
 
 describe("chat conversation and message routes", () => {
   let app: FastifyInstanceWithZod;
@@ -102,6 +104,56 @@ describe("chat conversation and message routes", () => {
 
     expect(unpinResponse.statusCode).toBe(200);
     expect(unpinResponse.json().pinnedAt).toBeNull();
+  });
+
+  test("marking a conversation read clears its unread flag in the list", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      scope: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+    await MessageModel.create({
+      conversationId: conversation.id,
+      role: "assistant",
+      content: { role: "assistant", parts: [{ type: "text", text: "hi" }] },
+    });
+
+    const before = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(before.json()[0].unread).toBe(true);
+    // The owner's private read marker must never reach the client (a shared
+    // viewer would otherwise see when the owner last read the chat).
+    expect(before.json()[0]).not.toHaveProperty("lastReadAt");
+
+    const readResponse = await app.inject({
+      method: "POST",
+      url: `/api/chat/conversations/${conversation.id}/read`,
+    });
+    expect(readResponse.statusCode).toBe(200);
+    expect(readResponse.json()).toEqual({ success: true });
+
+    const after = await app.inject({
+      method: "GET",
+      url: "/api/chat/conversations",
+    });
+    expect(after.json()[0].unread).toBe(false);
+  });
+
+  test("marking an unknown conversation read returns 404", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/chat/conversations/00000000-0000-4000-8000-000000000000/read",
+    });
+    expect(response.statusCode).toBe(404);
   });
 
   test("rejects a conversation update that sets a model without an API key", async ({
@@ -691,6 +743,69 @@ describe("chat conversation and message routes", () => {
         role: "assistant",
         parts: [{ type: "text", text: "Follow-up response" }],
       },
+    });
+
+    const response = await app.inject({
+      method: "PATCH",
+      url: `/api/chat/messages/${firstMessage.id}`,
+      payload: {
+        partIndex: 0,
+        text: "Updated text",
+        deleteSubsequentMessages: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().messages).toHaveLength(1);
+    expect(response.json().messages[0]).toMatchObject({
+      id: firstMessage.id,
+      parts: [{ type: "text", text: "Updated text" }],
+    });
+  });
+
+  test("deletes a subsequent message even when createdAt ties exactly", async ({
+    makeAgent,
+  }) => {
+    const agent = await makeAgent({
+      organizationId,
+      authorId: currentUser.id,
+      scope: "personal",
+    });
+    const conversation = await ConversationModel.create({
+      userId: currentUser.id,
+      organizationId,
+      agentId: agent.id,
+    });
+
+    // Force the createdAt tie the old strictly-greater comparison missed:
+    // back-to-back writes can land on the same timestamp, and "subsequent"
+    // must still mean insertion order — the (createdAt, id) tuple, with ids
+    // minted as monotonic UUIDv7 exactly like MessageModel.create does.
+    const tiedAt = new Date();
+    const [firstMessage] = await db
+      .insert(schema.messagesTable)
+      .values({
+        id: uuidv7(),
+        conversationId: conversation.id,
+        role: "user",
+        content: {
+          id: "tied-user-1",
+          role: "user",
+          parts: [{ type: "text", text: "Original text" }],
+        },
+        createdAt: tiedAt,
+      })
+      .returning();
+    await db.insert(schema.messagesTable).values({
+      id: uuidv7(),
+      conversationId: conversation.id,
+      role: "assistant",
+      content: {
+        id: "tied-assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Follow-up response" }],
+      },
+      createdAt: tiedAt,
     });
 
     const response = await app.inject({

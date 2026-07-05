@@ -8,6 +8,7 @@
 // the external-IdP session token resolver (IdP network call).
 import {
   getArchestraToolFullName,
+  TOOL_GET_AGENT_SHORT_NAME,
   TOOL_INVOCATION_APPROVAL_REQUIRED_AUTONOMOUS_REASON,
 } from "@archestra/shared";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -124,6 +125,7 @@ interface Fixtures {
     toolId: string,
     overrides: Record<string, unknown>,
   ) => Promise<unknown>;
+  seedAndAssignArchestraTools: (agentId: string) => Promise<void>;
 }
 
 // Test-context fixtures, captured once per test (vitest only hands fixtures to
@@ -145,6 +147,7 @@ beforeEach(
     makeInternalMcpCatalog,
     makeTool,
     makeToolPolicy,
+    seedAndAssignArchestraTools,
   }) => {
     f = {
       makeOrganization,
@@ -156,6 +159,7 @@ beforeEach(
       makeInternalMcpCatalog,
       makeTool,
       makeToolPolicy,
+      seedAndAssignArchestraTools,
     };
     vi.restoreAllMocks();
     vi.mocked(mcpClient.executeToolCallForOwner).mockReset();
@@ -333,6 +337,101 @@ describe("getChatMcpTools MCP tool execute pipeline", () => {
     );
   });
 
+  test("does not count a mid-call abort as a tool error metric", async () => {
+    const { baseParams } = await setupChatToolEnv({
+      gatewayTools: [externalTool("extsrv__fetch_data")],
+    });
+    vi.spyOn(hookDispatcherService, "fire").mockResolvedValue({
+      decision: "proceed",
+      runs: [],
+    });
+    const metricsSpy = vi.spyOn(metrics.mcp, "reportMcpToolCall");
+
+    const controller = new AbortController();
+    // The gateway call is cancelled mid-flight when the run is stopped: the
+    // signal aborts and the upstream request rejects (mcp-client rethrows it).
+    vi.mocked(mcpClient.executeToolCallForOwner).mockImplementation(
+      async () => {
+        controller.abort();
+        throw new Error("MCP error -32001: The operation was aborted");
+      },
+    );
+
+    const tools = await chatClient.getChatMcpTools({
+      ...baseParams,
+      abortSignal: controller.signal,
+    });
+
+    await expect(
+      tools.extsrv__fetch_data.execute?.(
+        { query: "q" },
+        execOptions("call-abort"),
+      ),
+    ).rejects.toThrow();
+
+    const errorMetricCalls = metricsSpy.mock.calls.filter(
+      ([arg]) => (arg as { isError?: boolean }).isError === true,
+    );
+    expect(errorMetricCalls).toEqual([]);
+  });
+
+  test("a run already stopped before the tool fires skips the gateway call and reports no metric", async () => {
+    const { baseParams } = await setupChatToolEnv({
+      gatewayTools: [externalTool("extsrv__fetch_data")],
+    });
+    const fireSpy = vi.spyOn(hookDispatcherService, "fire");
+    const metricsSpy = vi.spyOn(metrics.mcp, "reportMcpToolCall");
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const tools = await chatClient.getChatMcpTools({
+      ...baseParams,
+      abortSignal: controller.signal,
+    });
+
+    await expect(
+      tools.extsrv__fetch_data.execute?.(
+        { query: "q" },
+        execOptions("call-pre-abort"),
+      ),
+    ).rejects.toThrow();
+
+    // The pre-call abort check fires before the PreToolUse hook and the gateway
+    // call, and an already-stopped run is not a tool failure.
+    expect(fireSpy).not.toHaveBeenCalled();
+    expect(mcpClient.executeToolCallForOwner).not.toHaveBeenCalled();
+    expect(metricsSpy).not.toHaveBeenCalled();
+  });
+
+  test("a non-abort gateway tool-error result still reports an error metric", async () => {
+    const { baseParams } = await setupChatToolEnv({
+      gatewayTools: [externalTool("extsrv__fetch_data")],
+    });
+    vi.spyOn(hookDispatcherService, "fire").mockResolvedValue({
+      decision: "proceed",
+      runs: [],
+    });
+    const metricsSpy = vi.spyOn(metrics.mcp, "reportMcpToolCall");
+    vi.mocked(mcpClient.executeToolCallForOwner).mockResolvedValue({
+      content: [{ type: "text", text: "upstream failed" }],
+      isError: true,
+    } as never);
+
+    const tools = await chatClient.getChatMcpTools(baseParams);
+    const result = await tools.extsrv__fetch_data.execute?.(
+      { query: "q" },
+      execOptions("call-err"),
+    );
+
+    // A real (non-cancellation) failure must still count as a tool error — the
+    // abort suppression is specific to stopped runs.
+    expect(toolResultContent(result)).toContain("upstream failed");
+    expect(metricsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ isError: true }),
+    );
+  });
+
   test("a PreToolUse block short-circuits the gateway call and reports an error metric", async () => {
     const { baseParams } = await setupChatToolEnv({
       gatewayTools: [externalTool("extsrv__fetch_data")],
@@ -440,7 +539,6 @@ describe("getChatMcpTools agent delegation execute pipeline", () => {
 describe("getChatMcpTools approval gating", () => {
   test("blockOnApprovalRequired removes needsApproval and blocks approval-required execution", async () => {
     const { agent, org, baseParams } = await setupChatToolEnv({
-      orgOverrides: { globalToolPolicy: "restrictive" },
       isolationKey: "headless-exec-1",
       gatewayTools: [externalTool("extsrv__restricted_export")],
     });
@@ -529,9 +627,7 @@ describe("getChatMcpTools approval gating", () => {
   });
 
   test("delegation needsApproval targets the delegation tool itself, not a tool_name in args", async () => {
-    const { agent, org, baseParams } = await setupChatToolEnv({
-      orgOverrides: { globalToolPolicy: "restrictive" },
-    });
+    const { agent, org, baseParams } = await setupChatToolEnv();
     const catalog = await f.makeInternalMcpCatalog({ organizationId: org.id });
     const guardedTool = await f.makeTool({
       name: "extsrv__guarded_export",
@@ -604,6 +700,34 @@ describe("getChatMcpTools repeated-call circuit breaker", () => {
     expect(mcpClient.executeToolCallForOwner).toHaveBeenCalledTimes(
       MAX_IDENTICAL_TOOL_CALLS,
     );
+  });
+
+  test("an empty-args call repeating a validation error is fast-nudged on the third issue", async () => {
+    // An Archestra tool's validation error is args-deterministic, so the
+    // breaker nudges a step sooner than the generic threshold: the first two
+    // {} calls execute (each returning the actionable Zod error naming the
+    // missing fields), the third identical call is nudged without executing.
+    const toolName = getArchestraToolFullName(TOOL_GET_AGENT_SHORT_NAME);
+    const { agent, baseParams } = await setupChatToolEnv({
+      gatewayTools: [externalTool(toolName)],
+    });
+    await f.seedAndAssignArchestraTools(agent.id);
+
+    vi.spyOn(hookDispatcherService, "fire").mockResolvedValue({
+      decision: "proceed",
+      runs: [],
+    });
+
+    const tools = await chatClient.getChatMcpTools(baseParams);
+
+    const first = await tools[toolName].execute?.({}, execOptions("empty-1"));
+    expect(toolResultContent(first)).toContain("Validation error");
+    const second = await tools[toolName].execute?.({}, execOptions("empty-2"));
+    expect(toolResultContent(second)).toContain("Validation error");
+
+    const third = await tools[toolName].execute?.({}, execOptions("empty-3"));
+    expect(toolResultContent(third)).toContain("identical arguments");
+    expect(toolResultContent(third)).not.toContain("Validation error");
   });
 
   test("a different call resets the streak so a repeated call executes again", async () => {

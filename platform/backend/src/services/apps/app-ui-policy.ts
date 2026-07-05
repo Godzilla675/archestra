@@ -42,6 +42,27 @@ export const APP_PLATFORM_CSP: AppUiCsp = {
   resourceDomains: [...APP_PLATFORM_CSP_RESOURCE_DOMAINS],
 };
 
+/**
+ * The `window.archestra` member surface the platform injects into a rendered app
+ * (see `static/archestra-app-sdk.js`). Single source of truth for the SDK-usage
+ * lint in {@link validateAppHtmlStatic}; the drift guard in
+ * `app-sdk-injection.test.ts` cross-checks every member listed here against that
+ * file, so the allowlist cannot silently fall out of sync with the real SDK.
+ *
+ * @public — the export is consumed only by the drift-guard test, invisible to
+ * `knip --production`; the lint itself reads it in-module.
+ */
+export const ARCHESTRA_APP_SDK_SURFACE = {
+  topLevel: ["ready", "user", "context", "storage", "llm", "tools", "ui"],
+  storage: {
+    partitions: ["user", "shared"],
+    methods: ["get", "set", "list", "delete"],
+  },
+  tools: ["call", "list"],
+  llm: ["complete", "prompt"],
+  ui: ["openLink", "requestDisplayMode"],
+} as const;
+
 // The only iframe permissions an app may request. Mirrors AppUiPermissionsSchema
 // (whose .strict() already rejects unknown keys at parse time); kept here as the
 // explicit save-time allowlist with a clear per-key error.
@@ -92,6 +113,20 @@ export async function buildValidatedVersionPayload(params: {
   };
 }
 
+// Document-root probe, mirroring the Rust scanner's HEAD_OR_HTML
+// (app_html.rs): true when the HTML opens a <head> or <html> element. Used to
+// gate an edit that would strip a document root the base version still had — a
+// fragment-from-the-start app (no root to begin with) is unaffected. Kept as the
+// same raw-text regex as the scanner on purpose: its precision (it would also
+// match a `<html>` written inside a comment or string) is exactly the platform's
+// existing notion of "has a document root", so the edit gate and the save-time
+// warning never disagree.
+const HTML_DOCUMENT_ROOT_PATTERN = /<(head|html)[\s>]/i;
+
+export function htmlHasDocumentRoot(html: string): boolean {
+  return HTML_DOCUMENT_ROOT_PATTERN.test(html);
+}
+
 type AppValidationFinding = {
   severity: "error" | "warning";
   message: string;
@@ -99,19 +134,19 @@ type AppValidationFinding = {
 
 /**
  * Static, headless validation of an app's stored HTML for the `validate_app`
- * MCP tool. Reuses the save-time Rust scan (SDK self-bootstrap, platform-asset
- * self-loads, missing document root) — surfaced here as findings rather than a
- * thrown rejection so authoring tools can report them — and adds the one check
- * the scanner does not do: `<script src>`/`<link href>` hosts outside
- * {@link APP_PLATFORM_CSP_RESOURCE_DOMAINS}, which the served CSP blocks at
- * render time, are flagged as warnings. It cannot exercise runtime behaviour;
- * that gap is what the live diagnostics round-trip covers.
+ * MCP tool: the save-time Rust scan (surfaced as findings rather than a thrown
+ * rejection) plus the Rust-backed authoring lint — off-allowlist
+ * `<script src>`/`<link href>` hosts, browser storage APIs the sandbox breaks,
+ * and window.archestra members the injected SDK does not expose. This module
+ * stays the single source of truth for the policy inputs and the warning text;
+ * Rust returns structured lists. It cannot exercise runtime behaviour; that
+ * gap is what the live diagnostics round-trip covers.
  */
 export async function validateAppHtmlStatic(
   html: string,
 ): Promise<AppValidationFinding[]> {
   const findings: AppValidationFinding[] = [];
-  const { scanAppHtml } = await loadAppRuntimeNative();
+  const { scanAppHtml, lintAppHtml } = await loadAppRuntimeNative();
   const { rejection, warnings } = scanAppHtml(html);
   if (rejection) {
     findings.push({ severity: "error", message: rejectionMessage(rejection) });
@@ -119,7 +154,12 @@ export async function validateAppHtmlStatic(
   for (const warning of warnings) {
     findings.push({ severity: "warning", message: warning });
   }
-  for (const host of offAllowlistResourceHosts(html)) {
+  const lint = lintAppHtml(html, {
+    resourceHostAllowlist: [...APP_PLATFORM_CSP_RESOURCE_DOMAINS],
+    sdkTopLevelMembers: [...ARCHESTRA_APP_SDK_SURFACE.topLevel],
+    sdkStoragePartitions: [...ARCHESTRA_APP_SDK_SURFACE.storage.partitions],
+  });
+  for (const host of lint.offAllowlistHosts) {
     findings.push({
       severity: "warning",
       message: `<script>/<link> references the host "${host}", which is outside the app CDN allowlist (${APP_PLATFORM_CSP_RESOURCE_DOMAINS.join(
@@ -127,67 +167,33 @@ export async function validateAppHtmlStatic(
       )}); the sandbox CSP blocks it at render time. Load client-side assets from an allowlisted CDN, and fetch data through an assigned MCP tool instead.`,
     });
   }
-  const browserStorageApis = browserStorageApisUsed(html);
-  if (browserStorageApis.length > 0) {
+  if (lint.browserStorageApis.length > 0) {
     findings.push({
       severity: "warning",
-      message: `Uses browser storage (${browserStorageApis.join(
+      message: `Uses browser storage (${lint.browserStorageApis.join(
         ", ",
       )}), which is unavailable in the app sandbox (an opaque origin where it throws) and ephemeral browser-local state even where it works. Persist state through the platform-attached store instead: archestra.storage.user.* (private per viewer) or archestra.storage.shared.* (shared across viewers).`,
     });
   }
+  if (lint.storageMisuse.length > 0) {
+    findings.push({
+      severity: "warning",
+      message: `Accesses ${lint.storageMisuse.join(
+        ", ",
+      )} directly, but the store has no such member — it is partitioned. Call it on a partition instead: archestra.storage.user.* (private per viewer) or archestra.storage.shared.* (shared across viewers), e.g. archestra.storage.user.get(key).`,
+    });
+  }
+  if (lint.unknownTopLevel.length > 0) {
+    findings.push({
+      severity: "warning",
+      message: `Uses ${lint.unknownTopLevel.join(
+        ", ",
+      )}, which the injected window.archestra SDK does not expose. Its top-level surface is ${ARCHESTRA_APP_SDK_SURFACE.topLevel
+        .map((member) => `archestra.${member}`)
+        .join(", ")}.`,
+    });
+  }
   return findings;
-}
-
-const SCRIPT_BLOCK_PATTERN = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-const BROWSER_STORAGE_API_PATTERN =
-  /\b(localStorage|sessionStorage|indexedDB)\b/g;
-
-// Browser storage APIs referenced inside <script> blocks. Scoped to script
-// content (not the whole html) so prose, comments, and attribute text that
-// merely name an API do not warn — the same structural anchoring the resource
-// check uses. It stays a lexical scan: dynamic access (window["local"+"Storage"])
-// is not detected, which is acceptable for a soft authoring hint. They are
-// unusable in the app sandbox: the opaque-origin iframe throws on access, and
-// where it doesn't the data is ephemeral and browser-local rather than the
-// platform-attached archestra.storage. Returned in first-seen order, deduplicated.
-function browserStorageApisUsed(html: string): string[] {
-  const apis = new Set<string>();
-  for (const block of html.matchAll(SCRIPT_BLOCK_PATTERN)) {
-    for (const match of block[1].matchAll(BROWSER_STORAGE_API_PATTERN)) {
-      apis.add(match[1]);
-    }
-  }
-  return [...apis];
-}
-
-const RESOURCE_REF_PATTERN =
-  /<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*["']([^"']+)["']/gi;
-
-// External hosts referenced by <script src>/<link href> that are not on the CSP
-// resource allowlist (exact host match, mirroring CSP host-source semantics).
-function offAllowlistResourceHosts(html: string): string[] {
-  const allowlist = new Set<string>(APP_PLATFORM_CSP_RESOURCE_DOMAINS);
-  const hosts = new Set<string>();
-  for (const match of html.matchAll(RESOURCE_REF_PATTERN)) {
-    const host = externalHost(match[1]);
-    if (host && !allowlist.has(host)) {
-      hosts.add(host);
-    }
-  }
-  return [...hosts];
-}
-
-// The host of an absolute or protocol-relative http(s) URL; null for relative,
-// data:, blob:, or otherwise host-less refs (which the resource CSP ignores).
-function externalHost(ref: string): string | null {
-  const normalized = ref.startsWith("//") ? `https:${ref}` : ref;
-  if (!/^https?:\/\//i.test(normalized)) return null;
-  try {
-    return new URL(normalized).hostname;
-  } catch {
-    return null;
-  }
 }
 
 function rejectionMessage(rejection: {

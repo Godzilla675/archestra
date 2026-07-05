@@ -1,26 +1,15 @@
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { cacheManager } from "@/cache-manager";
 
-// Mock the distributed cache with an in-memory Map (preserve CacheKey etc.).
-// The `mock`-prefixed names are referenced lazily inside the fn bodies so they
-// survive vi.mock hoisting.
-const mockCache = new Map<string, unknown>();
-const mockSetCalls: Array<[string, unknown, number | undefined]> = [];
-vi.mock("@/cache-manager", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/cache-manager")>();
-  return {
-    ...actual,
-    cacheManager: {
-      get: vi.fn(async (key: string) => mockCache.get(key)),
-      set: vi.fn(async (key: string, value: unknown, ttl?: number) => {
-        mockCache.set(key, value);
-        mockSetCalls.push([key, value, ttl]);
-      }),
-      delete: vi.fn(async (key: string) => mockCache.delete(key)),
-    },
-  };
-});
+// The canonical Map-backed fake from src/__mocks__/cache-manager.ts stands in
+// for the distributed cache (preserves CacheKey etc.); the store resets before
+// every test. A spy over the fake's real set() lets tests assert the TTLs.
+vi.mock("@/cache-manager");
+
+const setSpy = vi.spyOn(cacheManager, "set");
 
 import {
+  claimThreadMuteHint,
   clearChannelThreadActive,
   isChannelThreadActive,
   isMuteReaction,
@@ -44,8 +33,6 @@ const TEAMS = {
 
 describe("channel-activation (sticky channel auto-reply)", () => {
   beforeEach(() => {
-    mockCache.clear();
-    mockSetCalls.length = 0;
     vi.clearAllMocks();
   });
 
@@ -90,8 +77,8 @@ describe("channel-activation (sticky channel auto-reply)", () => {
   test("marking active writes with the configured TTL", async () => {
     await markChannelThreadActive(TEAMS);
 
-    expect(mockSetCalls).toHaveLength(1);
-    const [key, value, ttl] = mockSetCalls[0];
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    const [key, value, ttl] = setSpy.mock.calls[0];
     expect(key).toContain(CHANNEL);
     expect(value).toBe(true);
     expect(ttl).toBe(CHATOPS_CHANNEL_AUTO_REPLY.ACTIVE_TTL_MS);
@@ -120,6 +107,56 @@ describe("channel-activation (sticky channel auto-reply)", () => {
     expect(await clearChannelThreadActive(TEAMS)).toBe(true);
     // Second clear (e.g. a redelivered event) is a no-op transition.
     expect(await clearChannelThreadActive(TEAMS)).toBe(false);
+  });
+});
+
+describe("claimThreadMuteHint", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test("returns true the first time and false thereafter (one hint per thread)", async () => {
+    expect(await claimThreadMuteHint(TEAMS)).toBe(true);
+    expect(await claimThreadMuteHint(TEAMS)).toBe(false);
+    expect(await claimThreadMuteHint(TEAMS)).toBe(false);
+  });
+
+  test("records the claim with the sticky auto-reply TTL", async () => {
+    await claimThreadMuteHint(TEAMS);
+
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    const [key, value, ttl] = setSpy.mock.calls[0];
+    expect(key).toContain(CHANNEL);
+    expect(value).toBe(true);
+    expect(ttl).toBe(CHATOPS_CHANNEL_AUTO_REPLY.ACTIVE_TTL_MS);
+  });
+
+  test("is scoped per (provider, channel, thread)", async () => {
+    expect(await claimThreadMuteHint(TEAMS)).toBe(true);
+
+    // Same channel/thread, other provider → independent claim.
+    expect(await claimThreadMuteHint({ ...TEAMS, provider: "slack" })).toBe(
+      true,
+    );
+    // Same channel, different thread → independent claim.
+    expect(
+      await claimThreadMuteHint({ ...TEAMS, threadId: "other-thread" }),
+    ).toBe(true);
+    // Different channel, same thread → independent claim.
+    expect(
+      await claimThreadMuteHint({
+        ...TEAMS,
+        channelId: "19:other@thread.tacv2",
+      }),
+    ).toBe(true);
+  });
+
+  test("its key does not collide with the activation key (mute ≠ hint)", async () => {
+    await markChannelThreadActive(TEAMS);
+    // The hint slot is still unclaimed even though the thread is active.
+    expect(await claimThreadMuteHint(TEAMS)).toBe(true);
+    // ...and claiming the hint does not deactivate the thread.
+    expect(await isChannelThreadActive(TEAMS)).toBe(true);
   });
 });
 
