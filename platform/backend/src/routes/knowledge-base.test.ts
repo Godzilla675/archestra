@@ -861,6 +861,49 @@ describe("knowledge base routes", () => {
 
       expect(response.statusCode).toBe(400);
     });
+
+    test("rejects auto-sync-permissions for unsupported connector type on create", async () => {
+      const original = config.enterpriseFeatures.knowledgeBase;
+      Object.defineProperty(config.enterpriseFeatures, "knowledgeBase", {
+        value: true,
+        writable: true,
+        configurable: true,
+      });
+      enterpriseTier.setUserCountForTesting(5);
+      try {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/connectors",
+          payload: {
+            name: "Perforce Auto-Sync",
+            connectorType: "perforce",
+            visibility: "auto-sync-permissions",
+            config: {
+              type: "perforce",
+              serverUrl: "https://perforce.example.com:8080",
+              depotPaths: ["//depot/docs/..."],
+              fileTypes: [".md"],
+            },
+            credentials: {
+              email: "svc-knowledge",
+              apiToken: "perforce-ticket",
+            },
+          },
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(response.json().error.message).toContain(
+          "Auto-sync permissions is not supported for connector type",
+        );
+      } finally {
+        Object.defineProperty(config.enterpriseFeatures, "knowledgeBase", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+        enterpriseTier.setUserCountForTesting(0);
+      }
+    });
   });
 
   describe("GET /api/connectors", () => {
@@ -1060,6 +1103,49 @@ describe("knowledge base routes", () => {
         });
 
         expect(response.statusCode).toBe(200);
+      } finally {
+        Object.defineProperty(config.enterpriseFeatures, "knowledgeBase", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+        enterpriseTier.setUserCountForTesting(0);
+      }
+    });
+
+    test("rejects auto-sync-permissions for unsupported connector type on update", async () => {
+      const connector = await KnowledgeBaseConnectorModel.create({
+        organizationId,
+        name: "Perforce Connector",
+        connectorType: "perforce",
+        config: {
+          type: "perforce",
+          serverUrl: "https://perforce.example.com:8080",
+          depotPaths: ["//depot/docs"],
+          fileTypes: [".md"],
+        },
+      });
+
+      const original = config.enterpriseFeatures.knowledgeBase;
+      Object.defineProperty(config.enterpriseFeatures, "knowledgeBase", {
+        value: true,
+        writable: true,
+        configurable: true,
+      });
+      enterpriseTier.setUserCountForTesting(5);
+      try {
+        const response = await app.inject({
+          method: "PUT",
+          url: `/api/connectors/${connector.id}`,
+          payload: {
+            visibility: "auto-sync-permissions",
+          },
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(response.json().error.message).toContain(
+          "Auto-sync permissions is not supported for connector type",
+        );
       } finally {
         Object.defineProperty(config.enterpriseFeatures, "knowledgeBase", {
           value: original,
