@@ -1,4 +1,4 @@
-import { eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import db, { schema } from "@/database";
 import { TeamModel } from "@/models";
 import type { Team } from "@/types";
@@ -51,10 +51,13 @@ export class IdentityResolutionService {
         eq(schema.membersTable.userId, schema.usersTable.id),
       )
       .where(
-        sql`LOWER(${schema.usersTable.email}) IN ${sql`(${sql.join(
-          normalized.map((e) => sql`${e}`),
-          sql`, `,
-        )})`}`,
+        and(
+          eq(schema.membersTable.organizationId, this.orgId),
+          sql`LOWER(${schema.usersTable.email}) IN ${sql`(${sql.join(
+            normalized.map((e) => sql`${e}`),
+            sql`, `,
+          )})`}`,
+        ),
       );
 
     const activeEmails = new Set(

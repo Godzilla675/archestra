@@ -69,6 +69,25 @@ describe("IdentityResolutionService", () => {
       expect(result).toEqual([]);
     });
 
+    test("does not resolve emails that only belong to another organization", async ({
+      makeOrganization,
+      makeUser,
+      makeMember,
+    }) => {
+      const org = await makeOrganization();
+      const otherOrg = await makeOrganization();
+      const resolver = new IdentityResolutionService(org.id);
+
+      const otherOrgUser = await makeUser({ email: "shared@example.com" });
+      await makeMember(otherOrgUser.id, otherOrg.id, { role: "member" });
+
+      const result = await resolver.resolveEmailsToMembers([
+        "shared@example.com",
+      ]);
+
+      expect(result).toEqual([]);
+    });
+
     test("returns empty array for empty input", async ({
       makeOrganization,
     }) => {

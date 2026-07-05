@@ -10,6 +10,7 @@ import { z } from "zod";
 import { hasPermission } from "@/auth";
 import { enterpriseTier } from "@/enterprise-tier";
 import { handleTeamOrGroupMappingChange } from "@/knowledge-base/recomputation";
+import logger from "@/logging";
 import { TeamLabelModel, TeamModel } from "@/models";
 import {
   canManageTeamMembers,
@@ -32,6 +33,21 @@ import {
   UpdateTeamBodySchema,
   UpdateTeamMemberBodySchema,
 } from "@/types";
+import { trackBackgroundWork } from "@/utils/background-work";
+
+function enqueuePermissionRecomputeForTeamChange(organizationId: string): void {
+  trackBackgroundWork(
+    handleTeamOrGroupMappingChange(organizationId).catch((err) => {
+      logger.error(
+        {
+          error: err instanceof Error ? err.message : String(err),
+          organizationId,
+        },
+        "Failed to enqueue permission recompute after team change",
+      );
+    }),
+  );
+}
 
 const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
   fastify.get(
@@ -314,7 +330,7 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
 
       const member = await TeamModel.addMember(id, userId, role);
 
-      await handleTeamOrGroupMappingChange(organizationId);
+      enqueuePermissionRecomputeForTeamChange(organizationId);
 
       return reply.send(member);
     },
@@ -413,7 +429,7 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "Team member not found");
       }
 
-      await handleTeamOrGroupMappingChange(organizationId);
+      enqueuePermissionRecomputeForTeamChange(organizationId);
       // Clean up invalid credential sources (personal tokens) for this user
       // if they no longer have access to agents through other teams
       try {
@@ -588,7 +604,7 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         normalizedGroupIdentifier,
       );
 
-      await handleTeamOrGroupMappingChange(organizationId);
+      enqueuePermissionRecomputeForTeamChange(organizationId);
 
       return reply.send(externalGroup);
     },
@@ -640,7 +656,7 @@ const teamRoutes: FastifyPluginAsyncZod = async (fastify) => {
         throw new ApiError(404, "External group mapping not found");
       }
 
-      await handleTeamOrGroupMappingChange(organizationId);
+      enqueuePermissionRecomputeForTeamChange(organizationId);
 
       return reply.send({ success: true });
     },

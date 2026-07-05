@@ -207,15 +207,9 @@ class KbDocumentModel {
   }
 
   static async create(data: InsertKbDocument): Promise<KbDocument> {
-    const insertData = {
-      ...data,
-      permissionSyncStatus:
-        data.permissionSyncStatus ?? null,
-    } as typeof schema.kbDocumentsTable.$inferInsert;
-
     const [result] = await db
       .insert(schema.kbDocumentsTable)
-      .values(insertData)
+      .values(data as typeof schema.kbDocumentsTable.$inferInsert)
       .returning();
 
     return result as KbDocument;
@@ -225,19 +219,13 @@ class KbDocumentModel {
     id: string,
     data: Partial<UpdateKbDocument>,
   ): Promise<KbDocument | null> {
-    const updateData = {
-      ...data,
-      permissionSyncStatus:
-        data.permissionSyncStatus ?? null,
-    } as typeof schema.kbDocumentsTable.$inferInsert;
-
     const [result] = await db
       .update(schema.kbDocumentsTable)
-      .set(updateData)
+      .set(data as Partial<typeof schema.kbDocumentsTable.$inferInsert>)
       .where(eq(schema.kbDocumentsTable.id, id))
       .returning();
 
-    return result as KbDocument | null;
+    return (result as KbDocument | undefined) ?? null;
   }
 
   static async delete(id: string): Promise<boolean> {

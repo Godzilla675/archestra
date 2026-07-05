@@ -559,8 +559,6 @@ export interface ConnectorDocument {
     users?: string[];
     groups?: string[];
     isPublic?: boolean;
-    complete?: boolean;
-    debug?: Record<string, unknown>;
   };
   /**
    * Optional inline media (image) data. When present, the pipeline will embed

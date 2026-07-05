@@ -16,6 +16,7 @@ import IdentityProviderModel, {
 } from "@/models/identity-provider.ee";
 import MemberModel from "@/models/member";
 import TeamModel from "@/models/team";
+import { trackBackgroundWork } from "@/utils/background-work";
 
 /** @public — consumed via dynamic import in src/auth/better-auth.ts */
 export const ssoConfig = {
@@ -466,12 +467,17 @@ export async function syncSsoTeams(
         },
         "[syncSsoTeams] SSO team sync completed - memberships changed",
       );
-      handleTeamOrGroupMappingChange(organizationId).catch((err) => {
-        logger.error(
-          { error: err.message, organizationId },
-          "Failed to recompute permissions after SSO team sync",
-        );
-      });
+      trackBackgroundWork(
+        handleTeamOrGroupMappingChange(organizationId).catch((err) => {
+          logger.error(
+            {
+              error: err instanceof Error ? err.message : String(err),
+              organizationId,
+            },
+            "Failed to recompute permissions after SSO team sync",
+          );
+        }),
+      );
     } else {
       logger.debug(
         { userId, email: userEmail, providerId },

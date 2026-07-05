@@ -368,6 +368,34 @@ describe("KbDocumentModel", () => {
       expect(updated?.chunkCount).toBe(10);
     });
 
+    test("preserves permission sync fields during partial updates", async ({
+      makeOrganization,
+      makeKnowledgeBase,
+      makeKnowledgeBaseConnector,
+    }) => {
+      const org = await makeOrganization();
+      const kb = await makeKnowledgeBase(org.id);
+      const connector = await makeKnowledgeBaseConnector(kb.id, org.id);
+      const doc = await KbDocumentModel.create(
+        createDocumentData(connector.id, org.id, {
+          permissionSyncStatus: "synced",
+          permissionSyncMetadata: {
+            provider: "jira",
+            rawPermissions: { isPublic: true },
+          },
+        }),
+      );
+
+      const updated = await KbDocumentModel.update(doc.id, {
+        embeddingStatus: "completed",
+      });
+
+      expect(updated?.permissionSyncStatus).toBe("synced");
+      expect(updated?.permissionSyncMetadata).toEqual(
+        expect.objectContaining({ provider: "jira" }),
+      );
+    });
+
     test("returns null for non-existent id", async () => {
       const updated = await KbDocumentModel.update(
         "00000000-0000-0000-0000-000000000000",
